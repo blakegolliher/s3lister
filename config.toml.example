@@ -1,0 +1,24 @@
+# S3 Lister Configuration
+
+[s3]
+access_key = "YOUR_ACCESS_KEY"
+secret_key = "YOUR_SECRET_KEY"
+endpoint   = "https://s3.amazonaws.com"
+bucket     = "my-bucket"
+prefix     = ""
+region     = "us-east-1"
+
+[workers]
+# Number of goroutines listing/heading S3 objects
+readers = 32
+# Number of goroutines flushing to RocksDB
+writers = 8
+# Channel buffer size between readers and writers
+queue_size = 100000
+
+[storage]
+# Path to Pebble database directory
+db_path = "./s3lister.db"
+
+[logging]
+log_file = "./s3lister.log"
