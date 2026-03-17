@@ -2,10 +2,12 @@ package worker
 
 import "sync"
 
-// WorkItem represents a unit of work (an S3 prefix to list).
+// WorkItem represents a unit of work (an S3 prefix or range to list).
 type WorkItem struct {
-	Prefix string
-	Depth  int
+	Prefix     string
+	Depth      int
+	StartAfter string // if set, list only keys > StartAfter (for range splitting)
+	EndBefore  string // if set, stop listing when key >= EndBefore
 }
 
 // Deque is a thread-safe double-ended queue for work stealing.
@@ -15,8 +17,8 @@ type WorkItem struct {
 type Deque struct {
 	mu   sync.Mutex
 	buf  []WorkItem
-	head int // index of first element
-	tail int // index one past last element
+	head int
+	tail int
 	len  int
 }
 
@@ -56,7 +58,6 @@ func (d *Deque) PushBatch(items []WorkItem) {
 	for d.len+len(items) > len(d.buf) {
 		d.grow()
 	}
-	// Push in reverse order so items[0] ends up at front
 	for i := len(items) - 1; i >= 0; i-- {
 		d.head = (d.head - 1 + len(d.buf)) % len(d.buf)
 		d.buf[d.head] = items[i]
@@ -73,7 +74,7 @@ func (d *Deque) PopFront() (WorkItem, bool) {
 		return WorkItem{}, false
 	}
 	item := d.buf[d.head]
-	d.buf[d.head] = WorkItem{} // clear reference
+	d.buf[d.head] = WorkItem{}
 	d.head = (d.head + 1) % len(d.buf)
 	d.len--
 	return item, true
@@ -94,7 +95,7 @@ func (d *Deque) StealBack() ([]WorkItem, bool) {
 	for i := 0; i < count; i++ {
 		idx := (d.tail - count + i + len(d.buf)) % len(d.buf)
 		stolen[i] = d.buf[idx]
-		d.buf[idx] = WorkItem{} // clear reference
+		d.buf[idx] = WorkItem{}
 	}
 	d.tail = (d.tail - count + len(d.buf)) % len(d.buf)
 	d.len -= count
