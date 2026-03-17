@@ -2,6 +2,16 @@
 
 A high-performance S3 object lister that records every object's full key path, size, and last-modified date into a local Pebble database. Designed for buckets with tens of millions to billions of objects.
 
+## Example
+```
+[bg@chewbacca s3lister]$ sudo ./s3lister scan -config ./config.toml
+  listed=385061524  written=385061524  queued=0  rate=30193/s  elapsed=3h32m33.337s   s
+
+Done! 385061524 objects in 3h32m36.772s (30185/s)
+Database: ./s3lister.db
+Log: /var/log/s3lister.log
+[bg@chewbacca s3lister]$
+```
 ## Quick Start
 
 ```bash
