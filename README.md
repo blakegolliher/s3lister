@@ -108,14 +108,6 @@ log_file = "/var/log/s3lister.log"
 
 Readers are network-bound (S3 API calls). Writers are I/O-bound (Pebble flushes). The queue decouples them so neither side blocks the other. When in doubt, add more readers.
 
-### S3-Compatible Endpoints
-
-Works with any S3-compatible API. Set `endpoint` accordingly:
-
-- AWS S3: `https://s3.amazonaws.com`
-- MinIO: `http://minio.local:9000`
-- Ceph RGW: `http://rgw.local:8080`
-- Wasabi: `https://s3.wasabisys.com`
 
 ## Logging
 
