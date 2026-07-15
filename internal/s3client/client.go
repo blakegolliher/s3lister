@@ -3,7 +3,6 @@ package s3client
 import (
 	"context"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"net/http"
@@ -108,8 +107,3 @@ func (t *loggingTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 
 // Ensure loggingTransport implements RoundTripper
 var _ http.RoundTripper = (*loggingTransport)(nil)
-
-// discardLogger returns a logger that writes nowhere (for Pebble).
-func DiscardLogger() *log.Logger {
-	return log.New(io.Discard, "", 0)
-}

@@ -12,13 +12,13 @@ go build -o s3lister .
 go install .
 ```
 
-No CGO required. All dependencies are pure Go, including the Pebble database engine (CockroachDB's RocksDB replacement).
+No CGO required. All dependencies are pure Go, including the Parquet writer.
 
 ### Dependencies
 
 | Package | Purpose |
 |---------|---------|
-| `github.com/cockroachdb/pebble` | Embedded key-value store (pure Go) |
+| `github.com/parquet-go/parquet-go` | Parquet reader/writer (pure Go) |
 | `github.com/aws/aws-sdk-go-v2` | S3 API client |
 | `github.com/BurntSushi/toml` | Config file parsing |
 
@@ -34,22 +34,25 @@ No CGO required. All dependencies are pure Go, including the Pebble database eng
 ┌─────────────────────┐          ┌─────────────────────┐
 │    ReaderPool        │          │    WriterPool        │
 │  (N goroutines)      │          │  (M goroutines)      │
-│                      │          │                      │
-│  ┌────┐ ┌────┐      │  chan    │  batch 5000 records  │
-│  │ D1 │ │ D2 │ ...  │────────▶│  per Pebble commit   │
-│  └────┘ └────┘      │          │                      │
+│                      │  chan    │                      │
+│  ┌────┐ ┌────┐      │ []Object │  one part-NNN.parquet│
+│  │ D1 │ │ D2 │ ...  │─Record──▶│  per writer          │
+│  └────┘ └────┘      │ (a page) │  (zstd, 1M-row groups)│
 │   work-stealing      │          │                      │
 │   deques             │          │                      │
 └──────────┬───────────┘          └──────────┬───────────┘
            │                                 │
            ▼                                 ▼
 ┌─────────────────────┐          ┌─────────────────────┐
-│    S3 API            │          │    Pebble DB         │
-│  (ListObjectsV2)     │          │  (key → 16 bytes)    │
+│    S3 API            │          │  Parquet files       │
+│  (ListObjectsV2)     │          │  (DuckDB-queryable)  │
 └──────────────────────┘          └──────────────────────┘
 ```
 
-The system is a two-stage pipeline connected by a buffered Go channel.
+The system is a two-stage pipeline connected by a buffered Go channel. The
+channel carries **one whole `ListObjectsV2` page per message** (a
+`[]ObjectRecord` batch), so per-object channel and atomic overhead is amortized
+across up to 1000 objects.
 
 ## Stage 1: Reader Pool (S3 Listing)
 
@@ -91,42 +94,90 @@ When a worker's deque is empty:
 2. If all peers are empty, enter a spin-wait with **exponential backoff** (500μs → 50ms)
 3. Give up after 3 seconds if no work appears and no other workers are active
 
-## Stage 2: Writer Pool (Pebble Persistence)
+## Stage 2: Writer Pool (Parquet)
 
-**Package:** `internal/worker/writer.go`, `internal/store/store.go`
+**Package:** `internal/worker/writer.go`, `internal/pq/pq.go`
 
-Writer goroutines consume `ObjectRecord` structs from the shared channel and batch them into groups of 5000 before committing to Pebble.
+Each writer goroutine owns exactly **one output file** — `part-000.parquet`,
+`part-001.parquet`, and so on. Because no two writers share a file handle, there
+is no write lock and throughput scales with cores until zstd or disk IO
+saturates. DuckDB reads the whole set as a single table via a glob:
 
-### Storage Format
+```sql
+SELECT * FROM 's3lister_out/*.parquet';
+```
 
-Each record is stored as:
+Writers consume `[]ObjectRecord` batches from the channel, convert each record
+into a Parquet `Row` (computing the derived columns), and append. When a row
+group reaches 1,000,000 rows the writer flushes it and starts a new one, so
+memory stays flat regardless of total object count.
 
-- **Key:** The S3 object key (string bytes)
-- **Value:** 16 bytes — `[8 bytes: size as uint64 LE][8 bytes: last_modified as unix nanos LE]`
+### Schema
 
-### Pebble Tuning
+Each row is one S3 object. Derived columns are precomputed at write time so
+DuckDB filters get predicate/statistics pushdown instead of parsing keys per row.
 
-The database is configured for write-heavy throughput:
+| Column | Parquet type | Source |
+|--------|--------------|--------|
+| `key` | UTF8 | S3 object key |
+| `object_name` | UTF8 | basename after last `/` |
+| `extension` | UTF8 | text after last `.` in the name |
+| `parent_prefix` | UTF8 | everything before the last `/` |
+| `depth` | INT32 | count of `/` in the key |
+| `size_bytes` | INT64 | object size |
+| `last_modified` | TIMESTAMP(MICROS, UTC) | object last-modified time |
+| `etag` | UTF8 | ETag, surrounding quotes stripped |
+| `storage_class` | UTF8 | e.g. `STANDARD`, `GLACIER` |
+| `scan_id` | UTF8 | identifier for the scan run |
+| `scan_timestamp` | TIMESTAMP(MICROS, UTC) | when the scan started |
+
+`scan_id` and `scan_timestamp` are constant within a run, so they compress to
+almost nothing; they let you union several scans into one dataset and filter or
+diff by run.
+
+### Parquet Tuning
 
 | Setting | Value | Why |
 |---------|-------|-----|
-| MemTableSize | 128 MB | Large buffer before flushing to SST |
-| MemTableStopWritesThreshold | 4 | Allow 4 memtables before stalling |
-| MaxConcurrentCompactions | 4 | Parallel background compaction |
-| L0CompactionThreshold | 8 | Tolerate L0 buildup before compacting |
-| L0StopWritesThreshold | 36 | High ceiling before write stalls |
-| DisableWAL | true | No crash recovery needed (re-scan S3) |
-| NoSync on commit | true | OS can buffer writes |
+| Compression | zstd (level 3) | Best size/speed balance; S3 keys share prefixes and compress hard |
+| MaxRowsPerRowGroup | 1,000,000 | Bounds writer memory; auto-flush on reach |
+| Codec concurrency | 1 per writer | Parallelism comes from the writer pool, not per-codec threads |
+| Output buffering | 4 MB `bufio` per file | Big sequential IO to disk |
+
+### Why Parquet Instead of a Key-Value Store?
+
+For a write-once bucket snapshot, an LSM key-value store (Pebble/RocksDB) pays
+for features this workload never uses: it sorts and **rewrites data repeatedly**
+during background compaction (write amplification), and its values are opaque
+blobs that still need an export step before any query engine can read them.
+
+Parquet writes each row group exactly once, is columnar (so aggregates scan only
+the columns they touch), compresses far better on repetitive keys, and is read
+natively by DuckDB, Polars, PyArrow, Athena, Spark, and ClickHouse — no export.
 
 ## Connecting the Pipeline
 
-The buffered channel (`queue_size` in config) decouples readers from writers:
+A buffered channel decouples readers from writers. It carries `[]ObjectRecord`
+batches (one per S3 page), so `queue_size` in config — expressed in records — is
+converted to a batch capacity (`queue_size / 1000`, floored so every reader has
+slack). Back-pressure works the same either way:
 
 - **Readers faster than writers:** Channel fills up, readers block on send, back-pressure naturally throttles S3 calls
 - **Writers faster than readers:** Channel drains, writers block on receive, wake instantly when data arrives
 - **Balanced:** Both sides stay busy, channel acts as a shock absorber for burst variance
 
 This means the system is always either listing or writing (or both). No goroutine sits idle while there's work to do.
+
+## Progress & Stats
+
+**Package:** `internal/progress/progress.go`
+
+A single goroutine drives a `progress.Meter` on a 100 ms ticker. On a terminal it
+renders a live sweeping bar with humanized object count, smoothed (EMA) and peak
+throughput, queue depth, and elapsed time; on a non-TTY it degrades to a status
+line every 5 seconds. A 5-second ticker also writes a `[progress]` line to the
+log file. On completion, a stats block (objects, avg/peak rate, output size,
+bytes-per-object, error count) is written to both stderr and the log.
 
 ## S3 Client
 
@@ -139,30 +190,37 @@ The HTTP transport is tuned for high concurrency:
 - Compression disabled (S3 list responses are small, avoid CPU overhead)
 - 120s overall timeout
 
-A `ListBuckets` call on startup validates credentials and connectivity before committing to a full scan.
+A `HeadBucket` call on startup validates credentials and connectivity before
+committing to a full scan. (`HeadBucket` rather than `ListBuckets` so it works on
+endpoints that only grant access to the one configured bucket.)
 
-## Export Path
+## Query & Export Path
 
-The `export-csv` command opens Pebble in read-only mode and iterates all keys in sorted order. It uses:
+The primary "query path" is external: DuckDB (or any Parquet reader) globs the
+part files directly — see [docs/QUERY_DUCKDB.md](docs/QUERY_DUCKDB.md).
 
-- `encoding/csv` for correct RFC 4180 output
-- 4 MB buffered writer for I/O efficiency
-- 30-second progress reporting
+The optional `export-csv` command is for tools that only speak CSV. It opens each
+`part-*.parquet` with a `parquet.GenericReader[pq.Row]`, streams rows through
+`encoding/csv` into a 4 MB buffered writer, and reports progress every 30
+seconds.
 
 ## Project Layout
 
 ```
 s3lister/
-├── main.go                      # CLI, subcommands, orchestration
-├── config.toml                  # Example configuration
+├── main.go                      # CLI, subcommands, orchestration, stats
+├── config.toml                  # Configuration (gitignored; copy from example)
 ├── internal/
 │   ├── config/config.go         # TOML parsing and validation
+│   ├── model/record.go          # Shared ObjectRecord type (no storage deps)
 │   ├── s3client/client.go       # S3 client construction
-│   ├── store/store.go           # Pebble wrapper (read, write, iterate)
+│   ├── pq/pq.go                 # Parquet schema + per-file writer (zstd)
+│   ├── progress/progress.go     # TTY-aware progress bar + rate stats
 │   └── worker/
-│       ├── reader.go            # Reader pool + work-stealing logic
-│       ├── writer.go            # Writer pool + batching
+│       ├── reader.go            # Reader pool + work-stealing + range-split
+│       ├── writer.go            # Writer pool (one parquet file per writer)
 │       └── deque.go             # Ring-buffer deque for work stealing
+├── docs/QUERY_DUCKDB.md         # Schema + DuckDB query library
 ├── go.mod
 └── go.sum
 ```

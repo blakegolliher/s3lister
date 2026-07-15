@@ -1,42 +1,55 @@
 package worker
 
 import (
+	"fmt"
 	"log"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/blake-golliher/s3lister/internal/store"
+	"github.com/blake-golliher/s3lister/internal/model"
+	"github.com/blake-golliher/s3lister/internal/pq"
 )
 
-const batchSize = 5000
-
-// WriterPool reads ObjectRecords from a channel and batch-writes them to Pebble.
+// WriterPool consumes record batches from a channel and writes them to Parquet.
+// Each worker owns its own part-NNN.parquet file, so writers never contend on a
+// shared handle — the pool scales linearly with cores until zstd or disk IO
+// saturates.
 type WriterPool struct {
-	store   *store.Store
-	inCh    <-chan store.ObjectRecord
+	dir     string
+	scanID  string
+	scanTS  time.Time
+	inCh    <-chan []model.ObjectRecord
 	workers int
 	logger  *log.Logger
+	written atomic.Int64
 	errors  atomic.Int64
 }
 
-func NewWriterPool(s *store.Store, in <-chan store.ObjectRecord, workers int, logger *log.Logger) *WriterPool {
+func NewWriterPool(dir, scanID string, scanTS time.Time, in <-chan []model.ObjectRecord, workers int, logger *log.Logger) *WriterPool {
 	return &WriterPool{
-		store:   s,
+		dir:     dir,
+		scanID:  scanID,
+		scanTS:  scanTS,
 		inCh:    in,
 		workers: workers,
 		logger:  logger,
 	}
 }
 
-func (wp *WriterPool) Errors() int64 {
-	return wp.errors.Load()
-}
+// Written returns the total records written across all writers so far.
+func (wp *WriterPool) Written() int64 { return wp.written.Load() }
 
-// Run starts writer goroutines. They block on inCh and exit when it closes.
+// Errors returns the number of write errors encountered.
+func (wp *WriterPool) Errors() int64 { return wp.errors.Load() }
+
+// Run starts writer goroutines. They block on inCh and exit when it closes,
+// flushing their Parquet footers on the way out.
 func (wp *WriterPool) Run() {
 	start := time.Now()
-	wp.logger.Printf("[writer-pool] starting %d writers (batch_size=%d)", wp.workers, batchSize)
+	wp.logger.Printf("[writer-pool] starting %d writers -> %s (zstd, %d rows/group)",
+		wp.workers, wp.dir, 1_000_000)
 
 	var wg sync.WaitGroup
 	for i := 0; i < wp.workers; i++ {
@@ -49,40 +62,42 @@ func (wp *WriterPool) Run() {
 
 	wg.Wait()
 	wp.logger.Printf("[writer-pool] done: %d written, %d errors in %v",
-		wp.store.Written(), wp.errors.Load(), time.Since(start))
+		wp.written.Load(), wp.errors.Load(), time.Since(start))
 }
 
 func (wp *WriterPool) worker(id int) {
 	workerStart := time.Now()
-	batch := make([]store.ObjectRecord, 0, batchSize)
-	var totalWritten, totalBatches int64
+	name := fmt.Sprintf("part-%03d.parquet", id)
+	path := filepath.Join(wp.dir, name)
 
-	flush := func() {
-		if len(batch) == 0 {
-			return
+	w, err := pq.NewWriter(path, wp.scanID, wp.scanTS)
+	if err != nil {
+		wp.errors.Add(1)
+		wp.logger.Printf("[writer-%d] ERROR creating %s: %v", id, path, err)
+		// Keep draining so readers don't deadlock on a full channel.
+		for range wp.inCh {
 		}
-		batchStart := time.Now()
-		if err := wp.store.WriteBatch(batch); err != nil {
+		return
+	}
+
+	var count int64
+	for batch := range wp.inCh {
+		n, err := w.Append(batch)
+		if err != nil {
 			wp.errors.Add(1)
-			wp.logger.Printf("[writer-%d] ERROR batch write failed (%d records): %v", id, len(batch), err)
-			return
+			wp.logger.Printf("[writer-%d] ERROR append (%d records): %v", id, len(batch), err)
 		}
-		totalWritten += int64(len(batch))
-		totalBatches++
-		if elapsed := time.Since(batchStart); elapsed > 100*time.Millisecond {
-			wp.logger.Printf("[writer-%d] slow batch: %d records in %v", id, len(batch), elapsed)
-		}
-		batch = batch[:0]
-	}
-
-	for rec := range wp.inCh {
-		batch = append(batch, rec)
-		if len(batch) >= batchSize {
-			flush()
+		if n > 0 {
+			count += int64(n)
+			wp.written.Add(int64(n))
 		}
 	}
-	flush()
 
-	wp.logger.Printf("[writer-%d] done: %d records, %d batches in %v",
-		id, totalWritten, totalBatches, time.Since(workerStart))
+	if err := w.Close(); err != nil {
+		wp.errors.Add(1)
+		wp.logger.Printf("[writer-%d] ERROR closing %s: %v", id, name, err)
+	}
+
+	wp.logger.Printf("[writer-%d] done: %d records -> %s in %v",
+		id, count, name, time.Since(workerStart))
 }

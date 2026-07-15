@@ -9,16 +9,17 @@ prefix     = ""
 region     = "us-east-1"
 
 [workers]
-# Number of goroutines listing/heading S3 objects
+# Number of goroutines listing S3 objects (ListObjectsV2)
 readers = 32
-# Number of goroutines flushing to RocksDB
+# Number of goroutines writing Parquet files (one part-NNN.parquet per writer)
 writers = 8
-# Channel buffer size between readers and writers
+# Records buffered between readers and writers (back-pressure knob)
 queue_size = 100000
 
 [storage]
-# Path to Pebble database directory
-db_path = "./s3lister.db"
+# Directory that receives the part-NNN.parquet files.
+# Query the whole set with DuckDB: SELECT * FROM 'output_dir/*.parquet'
+output_dir = "./s3lister_out"
 
 [logging]
 log_file = "./s3lister.log"

@@ -23,7 +23,8 @@ type WorkersConfig struct {
 }
 
 type StorageConfig struct {
-	DBPath string `toml:"db_path"`
+	// OutputDir is the directory that receives the part-NNN.parquet files.
+	OutputDir string `toml:"output_dir"`
 }
 
 type LoggingConfig struct {
@@ -76,8 +77,8 @@ func (c *Config) validate() error {
 	c.Workers.Writers = clampDefault(c.Workers.Writers, 1, 128, 8)
 	c.Workers.QueueSize = clampDefault(c.Workers.QueueSize, 1000, 10_000_000, 100_000)
 
-	if c.Storage.DBPath == "" {
-		c.Storage.DBPath = "./s3lister.db"
+	if c.Storage.OutputDir == "" {
+		c.Storage.OutputDir = "./s3lister_out"
 	}
 	if c.Logging.LogFile == "" {
 		c.Logging.LogFile = "./s3lister.log"

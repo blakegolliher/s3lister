@@ -12,7 +12,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
-	"github.com/blake-golliher/s3lister/internal/store"
+	"github.com/blake-golliher/s3lister/internal/model"
 )
 
 const (
@@ -34,14 +34,14 @@ type ReaderPool struct {
 	bucket  string
 	prefix  string
 	workers int
-	outCh   chan<- store.ObjectRecord
+	outCh   chan<- []model.ObjectRecord
 	listed  atomic.Int64
 	logger  *log.Logger
 	deques  []*Deque
 	active  atomic.Int32
 }
 
-func NewReaderPool(client *s3.Client, bucket, prefix string, workers int, out chan<- store.ObjectRecord, logger *log.Logger) *ReaderPool {
+func NewReaderPool(client *s3.Client, bucket, prefix string, workers int, out chan<- []model.ObjectRecord, logger *log.Logger) *ReaderPool {
 	deques := make([]*Deque, workers)
 	for i := range deques {
 		deques[i] = NewDeque()
@@ -113,9 +113,7 @@ func (rp *ReaderPool) listPrefixes(ctx context.Context, prefix string) ([]string
 				prefixes = append(prefixes, *cp.Prefix)
 			}
 		}
-		for i := range page.Contents {
-			rp.emit(&page.Contents[i])
-		}
+		rp.emitBatch(toRecords(page.Contents))
 	}
 	return prefixes, nil
 }
@@ -298,10 +296,9 @@ func (rp *ReaderPool) listFlatOrSplit(ctx context.Context, id int, myDeque *Dequ
 		return 0
 	}
 
-	for i := range resp.Contents {
-		rp.emit(&resp.Contents[i])
-		count++
-	}
+	recs := toRecords(resp.Contents)
+	rp.emitBatch(recs)
+	count += int64(len(recs))
 
 	// If there's no more data, we're done
 	if !aws.ToBool(resp.IsTruncated) {
@@ -427,10 +424,9 @@ func (rp *ReaderPool) listContinuation(ctx context.Context, id int, prefix strin
 			rp.logger.Printf("[reader-%d] list error prefix=%q: %v", id, prefix, err)
 			return count
 		}
-		for i := range page.Contents {
-			rp.emit(&page.Contents[i])
-			count++
-		}
+		recs := toRecords(page.Contents)
+		rp.emitBatch(recs)
+		count += int64(len(recs))
 	}
 
 	if elapsed := time.Since(start); count > 1000 || elapsed > 2*time.Second {
@@ -465,6 +461,7 @@ func (rp *ReaderPool) listRange(ctx context.Context, id int, item WorkItem) int6
 			rp.logger.Printf("[reader-%d] range list error prefix=%q: %v", id, item.Prefix, err)
 			return count
 		}
+		recs := make([]model.ObjectRecord, 0, len(page.Contents))
 		for i := range page.Contents {
 			key := page.Contents[i].Key
 			if key == nil {
@@ -472,15 +469,18 @@ func (rp *ReaderPool) listRange(ctx context.Context, id int, item WorkItem) int6
 			}
 			// Stop if we've reached the end boundary
 			if item.EndBefore != "" && *key >= item.EndBefore {
+				rp.emitBatch(recs)
+				count += int64(len(recs))
 				if elapsed := time.Since(start); count > 1000 || elapsed > 2*time.Second {
 					rp.logger.Printf("[reader-%d] range prefix=%q %d objects in %v",
 						id, item.Prefix, count, elapsed)
 				}
 				return count
 			}
-			rp.emit(&page.Contents[i])
-			count++
+			recs = append(recs, toRecord(&page.Contents[i]))
 		}
+		rp.emitBatch(recs)
+		count += int64(len(recs))
 	}
 
 	if elapsed := time.Since(start); count > 1000 || elapsed > 2*time.Second {
@@ -490,17 +490,41 @@ func (rp *ReaderPool) listRange(ctx context.Context, id int, item WorkItem) int6
 	return count
 }
 
-func (rp *ReaderPool) emit(obj *s3types.Object) {
-	if obj.Key == nil {
+// emitBatch sends a whole page of records downstream in one channel operation
+// and accounts for them with a single atomic add. Sending per-page instead of
+// per-object cuts channel traffic and atomic contention by ~1000x at scale.
+func (rp *ReaderPool) emitBatch(recs []model.ObjectRecord) {
+	if len(recs) == 0 {
 		return
 	}
-	rec := store.ObjectRecord{
-		Key:  *obj.Key,
-		Size: aws.ToInt64(obj.Size),
+	rp.outCh <- recs
+	rp.listed.Add(int64(len(recs)))
+}
+
+// toRecord converts a single S3 object into a record. Caller must ensure
+// obj.Key != nil.
+func toRecord(obj *s3types.Object) model.ObjectRecord {
+	rec := model.ObjectRecord{
+		Key:          *obj.Key,
+		Size:         aws.ToInt64(obj.Size),
+		ETag:         aws.ToString(obj.ETag),
+		StorageClass: string(obj.StorageClass),
 	}
 	if obj.LastModified != nil {
 		rec.LastModified = *obj.LastModified
 	}
-	rp.outCh <- rec
-	rp.listed.Add(1)
+	return rec
+}
+
+// toRecords converts a page of S3 objects into a freshly allocated record
+// slice, skipping any objects with a nil key.
+func toRecords(objs []s3types.Object) []model.ObjectRecord {
+	recs := make([]model.ObjectRecord, 0, len(objs))
+	for i := range objs {
+		if objs[i].Key == nil {
+			continue
+		}
+		recs = append(recs, toRecord(&objs[i]))
+	}
+	return recs
 }

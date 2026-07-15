@@ -1,5 +1,7 @@
 s3lister
 s3lister.db/
+s3lister_out/
 s3lister.log
 *.csv
+*.parquet
 config.toml
