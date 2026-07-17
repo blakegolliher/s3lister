@@ -14,16 +14,49 @@ import (
 	"github.com/blake-golliher/s3lister/internal/config"
 )
 
+// New builds a client and verifies the configured bucket is reachable.
 func New(cfg *config.S3Config, verbose bool, logger *log.Logger) (*s3.Client, error) {
+	client, err := NewClient(cfg, verbose, logger)
+	if err != nil {
+		return nil, err
+	}
+
+	// HeadBucket instead of ListBuckets — works on endpoints that don't
+	// support ListBuckets and only requires access to the configured bucket
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	if verbose {
+		logger.Printf("[s3] checking bucket access: HeadBucket %q", cfg.Bucket)
+	}
+
+	_, err = client.HeadBucket(ctx, &s3.HeadBucketInput{
+		Bucket: aws.String(cfg.Bucket),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("S3 connectivity check failed (endpoint=%s bucket=%s): %w",
+			cfg.Endpoint, cfg.Bucket, err)
+	}
+
+	if verbose {
+		logger.Printf("[s3] bucket %q accessible, connection OK", cfg.Bucket)
+	}
+
+	return client, nil
+}
+
+// NewClient builds a client without any bucket existence check. Used by
+// commands that may create the bucket themselves (e.g. populate).
+func NewClient(cfg *config.S3Config, verbose bool, logger *log.Logger) (*s3.Client, error) {
 	transport := &http.Transport{
-		MaxIdleConns:          500,
-		MaxIdleConnsPerHost:   500,
-		IdleConnTimeout:       90 * time.Second,
+		MaxIdleConns:        1024,
+		MaxIdleConnsPerHost: 1024,
+		IdleConnTimeout:     90 * time.Second,
 		DialContext: (&net.Dialer{
 			Timeout:   10 * time.Second,
 			KeepAlive: 30 * time.Second,
 		}).DialContext,
-		TLSHandshakeTimeout:  10 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
 		ResponseHeaderTimeout: 30 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 		DisableCompression:    true,
@@ -53,27 +86,6 @@ func New(cfg *config.S3Config, verbose bool, logger *log.Logger) (*s3.Client, er
 	if verbose {
 		logger.Printf("[s3] connecting to endpoint=%s region=%s bucket=%s path_style=true",
 			cfg.Endpoint, cfg.Region, cfg.Bucket)
-	}
-
-	// HeadBucket instead of ListBuckets — works on endpoints that don't
-	// support ListBuckets and only requires access to the configured bucket
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-
-	if verbose {
-		logger.Printf("[s3] checking bucket access: HeadBucket %q", cfg.Bucket)
-	}
-
-	_, err := client.HeadBucket(ctx, &s3.HeadBucketInput{
-		Bucket: aws.String(cfg.Bucket),
-	})
-	if err != nil {
-		return nil, fmt.Errorf("S3 connectivity check failed (endpoint=%s bucket=%s): %w",
-			cfg.Endpoint, cfg.Bucket, err)
-	}
-
-	if verbose {
-		logger.Printf("[s3] bucket %q accessible, connection OK", cfg.Bucket)
 	}
 
 	return client, nil

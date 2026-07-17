@@ -5,3 +5,5 @@ s3lister.log
 *.csv
 *.parquet
 config.toml
+/s3lister-bench
+s3lister-bench.log

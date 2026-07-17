@@ -86,6 +86,8 @@ func runScan(args []string) {
 	configPath := fs.String("config", "config.toml", "path to config file")
 	readers := fs.Int("readers", 0, "override number of reader threads")
 	writers := fs.Int("writers", 0, "override number of writer threads")
+	bucket := fs.String("bucket", "", "override bucket from config")
+	output := fs.String("output", "", "override output directory from config")
 	verbose := fs.Bool("verbose", false, "verbose output: log to stderr and trace HTTP requests")
 	fs.Parse(args)
 
@@ -98,6 +100,12 @@ func runScan(args []string) {
 	}
 	if *writers > 0 {
 		cfg.Workers.Writers = *writers
+	}
+	if *bucket != "" {
+		cfg.S3.Bucket = *bucket
+	}
+	if *output != "" {
+		cfg.Storage.OutputDir = *output
 	}
 
 	logger, _, logFile := setupLogger(cfg.Logging.LogFile, *verbose)

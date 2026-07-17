@@ -159,6 +159,13 @@ log_file = "./s3lister.log"
 
 `-readers` / `-writers` on the command line override the config values.
 
+## Benchmarking
+
+Benchmark tooling lives in a separate binary, `s3lister-bench`, so the main
+tool stays focused on scanning. See **[bench-readme.md](bench-readme.md)** for
+how we generate benchmark buckets (5M / 100M / 2B keys), how we measure, and
+how to reproduce the numbers yourself.
+
 ## Performance
 
 Tuning notes:
