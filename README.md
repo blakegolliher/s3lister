@@ -173,6 +173,10 @@ Tuning notes:
 - **Readers** are network-bound. On high-latency or high-object-count buckets,
   more readers means more in-flight `ListObjectsV2` requests. 32–128 is typical;
   the work-stealing scheduler keeps them all busy.
+- **Point the endpoint at a DNS name, not one VIP.** New connections are
+  rotated across every IP the name resolves to (re-resolved every 30s), so
+  scale-out front ends see even load across all their nodes. The log shows
+  the discovered addresses at startup.
 - **Writers** are CPU-bound on zstd compression. Roughly one writer per core is a
   good starting point. More writers = more output part files.
 - **Large flat prefixes** (millions of keys under one prefix with no delimiters)

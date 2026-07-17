@@ -48,14 +48,18 @@ func New(cfg *config.S3Config, verbose bool, logger *log.Logger) (*s3.Client, er
 // NewClient builds a client without any bucket existence check. Used by
 // commands that may create the bucket themselves (e.g. populate).
 func NewClient(cfg *config.S3Config, verbose bool, logger *log.Logger) (*s3.Client, error) {
+	// Rotate new connections across every IP the endpoint resolves to, so
+	// scale-out front ends with many VIPs behind one DNS name see even load.
+	rrDialer := newRoundRobinDialer(&net.Dialer{
+		Timeout:   10 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}, logger)
+
 	transport := &http.Transport{
-		MaxIdleConns:        1024,
-		MaxIdleConnsPerHost: 1024,
-		IdleConnTimeout:     90 * time.Second,
-		DialContext: (&net.Dialer{
-			Timeout:   10 * time.Second,
-			KeepAlive: 30 * time.Second,
-		}).DialContext,
+		MaxIdleConns:          1024,
+		MaxIdleConnsPerHost:   1024,
+		IdleConnTimeout:       90 * time.Second,
+		DialContext:           rrDialer.DialContext,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ResponseHeaderTimeout: 30 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,

@@ -35,6 +35,19 @@ Only the `[s3]` endpoint/credentials/region matter for the benchmark flow.
 Leave `bucket` as any placeholder — the commands below name their buckets
 explicitly, and `s3lister-bench` creates them if they don't exist.
 
+**Use the DNS name of the endpoint, not a single VIP.** Both binaries
+resolve the hostname and rotate new connections across every IP it returns
+(re-resolving every 30s), so a scale-out front end with many VIPs behind one
+name gets even load. On startup the log records what was discovered:
+
+```
+[s3] endpoint main.selab... resolves to 16 address(es): 172.200.204.1, ...
+```
+
+Check that count matches the number of VIPs you expect the cluster to
+publish — if it says 1, your DNS name only returns one address and every
+connection lands on the same node.
+
 ### 3. Populate a benchmark bucket
 
 ```bash
