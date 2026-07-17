@@ -4,7 +4,6 @@ import (
 	"context"
 	"log"
 	"net"
-	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -89,13 +88,17 @@ func (d *roundRobinDialer) DialContext(ctx context.Context, network, addr string
 }
 
 // resolve returns the cached address list for host, refreshing it from DNS
-// every dnsRefreshInterval. On resolution failure a stale list is better
+// every dnsRefreshInterval. Single-address answers are never cached: DNS
+// services that load-balance by returning one VIP per query (rotating across
+// queries) would otherwise be frozen on whichever VIP the first query
+// returned — re-resolving per connection lets the server's rotation spread
+// the connections instead. On resolution failure a stale list is better
 // than none.
 func (d *roundRobinDialer) resolve(ctx context.Context, host string) []string {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	if d.host == host && len(d.ips) > 0 && time.Since(d.fetched) < dnsRefreshInterval {
+	if d.host == host && len(d.ips) > 1 && time.Since(d.fetched) < dnsRefreshInterval {
 		return d.ips
 	}
 
@@ -110,9 +113,14 @@ func (d *roundRobinDialer) resolve(ctx context.Context, host string) []string {
 	// its answers between refreshes.
 	sort.Strings(ips)
 
-	if d.host != host || !slices.Equal(ips, d.ips) {
+	// Log discovery once and on count changes — not on every single-address
+	// rotation, which would log per connection.
+	if d.host != host || len(ips) != len(d.ips) {
 		d.logger.Printf("[s3] endpoint %s resolves to %d address(es): %s",
 			host, len(ips), strings.Join(ips, ", "))
+		if len(ips) == 1 {
+			d.logger.Printf("[s3] single-address DNS answer: re-resolving on every connection so a server-side round-robin can still spread load")
+		}
 	}
 	d.host = host
 	d.ips = ips

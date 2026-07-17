@@ -106,6 +106,17 @@ Same three commands per tier — populate, scan, verify — for `bench-100m` and
   populate first.
 - **Endpoint unreachable / timeouts** — verify basic reachability with
   `curl -m 5 http://<endpoint>/` before debugging anything else.
+- **All load lands on one node** — check what DNS actually returns:
+  `dig +short <endpoint>` a few times in a row.
+  - *Same single IP every query*: the name is a static record pointing at one
+    VIP. No client can spread that — publish all VIPs under the name, or use
+    the storage system's delegated/load-balancing DNS name.
+  - *Different single IP each query*: server-side round-robin. The client
+    re-resolves on every new connection in this mode (it logs
+    `single-address DNS answer: re-resolving on every connection`), so
+    connections follow the server's rotation.
+  - *Many IPs per query*: the client rotates across all of them itself; the
+    startup log lists what it found.
 
 ## s3lister-bench reference
 

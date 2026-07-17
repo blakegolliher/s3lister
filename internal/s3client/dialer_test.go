@@ -38,6 +38,32 @@ func TestResolveCachesWithinRefreshInterval(t *testing.T) {
 	}
 }
 
+func TestResolveSingleAddressBypassesCache(t *testing.T) {
+	// DNS services that load-balance by returning one rotating VIP per query
+	// must be re-queried on every connection, not cached.
+	calls := 0
+	answers := []string{"10.0.0.1", "10.0.0.2", "10.0.0.3"}
+	d := testDialer(func(ctx context.Context, host string) ([]string, error) {
+		calls++
+		return []string{answers[(calls-1)%len(answers)]}, nil
+	})
+
+	var got []string
+	for i := 0; i < 3; i++ {
+		ips := d.resolve(context.Background(), "s3.example")
+		if len(ips) != 1 {
+			t.Fatalf("expected single address, got %v", ips)
+		}
+		got = append(got, ips[0])
+	}
+	if calls != 3 {
+		t.Fatalf("expected 3 lookups (no caching for single answers), got %d", calls)
+	}
+	if got[0] == got[1] && got[1] == got[2] {
+		t.Fatalf("expected rotating answers to surface, got %v", got)
+	}
+}
+
 func TestResolveKeepsStaleAddressesOnFailure(t *testing.T) {
 	fail := false
 	d := testDialer(func(ctx context.Context, host string) ([]string, error) {
