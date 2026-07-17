@@ -25,6 +25,10 @@ import (
 	"github.com/parquet-go/parquet-go"
 )
 
+// version is stamped at release build time via
+// -ldflags "-X main.version=vX.Y.Z"; source builds report "dev".
+var version = "dev"
+
 func main() {
 	if len(os.Args) < 2 {
 		printUsage()
@@ -34,6 +38,8 @@ func main() {
 		runScan(os.Args[2:])
 	case "export-csv":
 		runExportCSV(os.Args[2:])
+	case "version", "-version", "--version":
+		fmt.Println("s3lister", version)
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown command: %s\n", os.Args[1])
 		printUsage()
@@ -46,6 +52,7 @@ func printUsage() {
 Commands:
   scan         Scan S3 bucket and write Parquet files (DuckDB-queryable)
   export-csv   Export the Parquet dataset to a single CSV file
+  version      Print the s3lister version
 
 Run 's3lister <command> -help' for command-specific options.
 `)

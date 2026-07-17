@@ -37,10 +37,25 @@ Query it with DuckDB:
   duckdb -c "SELECT count(*), sum(size_bytes) FROM './s3lister_out/*.parquet'"
 ```
 
+## Download
+
+Prebuilt binaries for Linux, macOS, and Windows are on the
+**[Releases page](https://github.com/blakegolliher/s3lister/releases)** —
+each archive contains `s3lister`, the `s3lister-bench` benchmarking tool, and
+an example config. No runtime dependencies.
+
+```bash
+curl -LO https://github.com/blakegolliher/s3lister/releases/latest/download/s3lister_linux_amd64.tar.gz
+tar xzf s3lister_linux_amd64.tar.gz
+./s3lister version
+```
+
+Or build from source (Go 1.24+): `go build -o s3lister .`
+
 ## Quick Start
 
 ```bash
-# Build
+# Build (skip if you downloaded a release binary)
 go build -o s3lister .
 
 # Configure credentials
