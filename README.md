@@ -26,7 +26,7 @@ billions of objects.
 
 ```
 [bg@chewbacca s3lister]$ ./s3lister scan -config ./config.toml
-⠹ [░░░░░░░░░█▓░░░░░░░░░░░░░░░░░]  385,061,524 objs  30,193/s  q:2,039  3h32m33s
+⠹ [░░░░░░░░░█▓░░░░░░░░░░░░░░░░░]  385,061,524 objs  30,193/s  3h32m33s
 
 Done! 385061524 objects in 3h32m36s
   avg 30185/s   peak 34011/s
