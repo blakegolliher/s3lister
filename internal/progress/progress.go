@@ -28,6 +28,7 @@ type Meter struct {
 	lastTime time.Time
 
 	emaRate  float64 // smoothed instantaneous write rate (objects/sec)
+	emaQueue float64 // smoothed queue depth (listed but not yet written)
 	peakRate float64
 
 	lastLinePrint time.Time // throttle for non-TTY output
@@ -75,6 +76,10 @@ func (m *Meter) Render(listed, written int64) {
 	if queued < 0 {
 		queued = 0
 	}
+	// Readers emit whole 1000-object pages and writers drain in batches, so
+	// the raw difference whipsaws frame to frame; smooth it like the rate so
+	// the display drifts instead of flickering.
+	m.emaQueue = 0.8*m.emaQueue + 0.2*float64(queued)
 
 	if !m.isTTY {
 		// Only print a line every ~5s to avoid flooding piped output/logs.
@@ -98,7 +103,7 @@ func (m *Meter) Render(listed, written int64) {
 		spinner, bar,
 		humanInt(written),
 		humanInt(int64(m.emaRate)),
-		humanInt(queued),
+		humanInt(int64(m.emaQueue)),
 		elapsed.Round(time.Second))
 }
 
