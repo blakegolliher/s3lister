@@ -169,6 +169,18 @@ This is deliberately *not* a best-case layout for s3lister. A purely
 hierarchical bucket (`-flat-pct 0`) scans faster; the default keeps the
 awkward flat-prefix case in the measurement.
 
+## Results
+
+Scans of buckets populated with the default layout (90% hierarchical /
+10% flat), run from a single Ubuntu 24.04 client VM against a 6-VIP
+S3 endpoint, connections spread across all VIPs via DNS discovery:
+
+| Bucket | Objects | Wall time | Avg objs/s | Peak objs/s | Readers | Writers | Output size | Exactness |
+|--------|---------|-----------|------------|-------------|---------|---------|-------------|-----------|
+| bench-5m | 5,000,000 | 30.3s | 165,022 | 202,051 | 32 | 8 | 43.4 MiB | ✓ 5,000,000 |
+| bench-100m | 100,000,000 | — | — | — | — | — | — | pending |
+| bench-2b | 2,000,000,000 | — | — | — | — | — | — | pending |
+
 ## Reporting
 
 For published numbers, record alongside the objects/sec figure:
