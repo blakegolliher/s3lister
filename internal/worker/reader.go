@@ -2,7 +2,6 @@ package worker
 
 import (
 	"context"
-	"fmt"
 	"log"
 	"math/rand"
 	"sync"
@@ -16,19 +15,21 @@ import (
 )
 
 const (
-	maxSplitDepth    = 8             // generous depth limit for prefix splitting
-	stealBackoffMin  = 500 * time.Microsecond
-	stealBackoffMax  = 50 * time.Millisecond
-	stealGiveUpAfter = 5 * time.Second
-	delimiter        = "/"
-	// If a flat listing returns this many objects on the first page and has
-	// more pages, we probe for range-split markers to parallelize it.
-	rangeSplitThreshold = 5000
+	maxSplitDepth   = 8 // generous depth limit for prefix splitting
+	stealBackoffMin = 500 * time.Microsecond
+	stealBackoffMax = 50 * time.Millisecond
+	delimiter       = "/"
 	// How many range chunks to split a large flat prefix into.
 	rangeSplitFactor = 8
 )
 
 // ReaderPool fans out S3 listing with true work-stealing.
+//
+// Emission invariant: every object is emitted exactly once. Each WorkItem
+// covers a disjoint slice of the keyspace — either "the objects directly at
+// one prefix level" (delimiter listing; sub-prefixes become new WorkItems) or
+// "a bounded key range under one prefix" (range listing). No code path lists
+// the same slice twice.
 type ReaderPool struct {
 	client  *s3.Client
 	bucket  string
@@ -38,7 +39,7 @@ type ReaderPool struct {
 	listed  atomic.Int64
 	logger  *log.Logger
 	deques  []*Deque
-	active  atomic.Int32
+	working atomic.Int32 // workers currently processing an item
 }
 
 func NewReaderPool(client *s3.Client, bucket, prefix string, workers int, out chan<- []model.ObjectRecord, logger *log.Logger) *ReaderPool {
@@ -63,22 +64,13 @@ func (rp *ReaderPool) Listed() int64 {
 
 func (rp *ReaderPool) Run(ctx context.Context) error {
 	start := time.Now()
-	rp.logger.Printf("[reader-pool] starting prefix discovery bucket=%s prefix=%s", rp.bucket, rp.prefix)
+	rp.logger.Printf("[reader-pool] starting bucket=%s prefix=%q workers=%d",
+		rp.bucket, rp.prefix, rp.workers)
 
-	seeds, err := rp.discoverPrefixes(ctx)
-	if err != nil {
-		return fmt.Errorf("prefix discovery failed: %w", err)
-	}
-	if len(seeds) == 0 {
-		seeds = []WorkItem{{Prefix: rp.prefix, Depth: 0}}
-	}
-
-	rp.logger.Printf("[reader-pool] %d seed prefixes in %v, starting %d workers",
-		len(seeds), time.Since(start), rp.workers)
-
-	for i, seed := range seeds {
-		rp.deques[i%rp.workers].PushFront(seed)
-	}
+	// Seed with the root prefix. The first worker to process it pushes the
+	// top-level sub-prefixes, which idle workers immediately steal — the pool
+	// reaches full parallelism within a couple of listing calls.
+	rp.deques[0].PushFront(WorkItem{Prefix: rp.prefix, Depth: 0})
 
 	var wg sync.WaitGroup
 	for i := 0; i < rp.workers; i++ {
@@ -94,90 +86,13 @@ func (rp *ReaderPool) Run(ctx context.Context) error {
 	return nil
 }
 
-// listPrefixes does a single delimiter-based listing, returning sub-prefixes
-// and emitting any objects found at this level.
-func (rp *ReaderPool) listPrefixes(ctx context.Context, prefix string) ([]string, error) {
-	var prefixes []string
-	paginator := s3.NewListObjectsV2Paginator(rp.client, &s3.ListObjectsV2Input{
-		Bucket:    aws.String(rp.bucket),
-		Prefix:    aws.String(prefix),
-		Delimiter: aws.String(delimiter),
-	})
-	for paginator.HasMorePages() {
-		page, err := paginator.NextPage(ctx)
-		if err != nil {
-			return nil, err
-		}
-		for _, cp := range page.CommonPrefixes {
-			if cp.Prefix != nil {
-				prefixes = append(prefixes, *cp.Prefix)
-			}
-		}
-		rp.emitBatch(toRecords(page.Contents))
-	}
-	return prefixes, nil
-}
-
-func (rp *ReaderPool) discoverPrefixes(ctx context.Context) ([]WorkItem, error) {
-	prefixes, err := rp.listPrefixes(ctx, rp.prefix)
-	if err != nil {
-		return nil, err
-	}
-
-	items := prefixesToWorkItems(prefixes, 0)
-
-	if len(items) > 0 && len(items) < rp.workers*2 {
-		expanded := rp.expandSeeds(ctx, items)
-		if len(expanded) > len(items) {
-			items = expanded
-		}
-	}
-	return items, nil
-}
-
-func (rp *ReaderPool) expandSeeds(ctx context.Context, seeds []WorkItem) []WorkItem {
-	var mu sync.Mutex
-	var result []WorkItem
-	var wg sync.WaitGroup
-
-	for _, seed := range seeds {
-		wg.Add(1)
-		go func(s WorkItem) {
-			defer wg.Done()
-			prefixes, err := rp.listPrefixes(ctx, s.Prefix)
-			mu.Lock()
-			defer mu.Unlock()
-			if err != nil {
-				rp.logger.Printf("[reader-pool] expand error prefix=%q: %v", s.Prefix, err)
-				result = append(result, s)
-			} else if len(prefixes) == 0 {
-				result = append(result, s)
-			} else {
-				result = append(result, prefixesToWorkItems(prefixes, s.Depth+1)...)
-			}
-		}(seed)
-	}
-	wg.Wait()
-	return result
-}
-
-func prefixesToWorkItems(prefixes []string, depth int) []WorkItem {
-	items := make([]WorkItem, len(prefixes))
-	for i, p := range prefixes {
-		items[i] = WorkItem{Prefix: p, Depth: depth}
-	}
-	return items
-}
-
 func (rp *ReaderPool) worker(ctx context.Context, id int) {
 	workerStart := time.Now()
 	myDeque := rp.deques[id]
 	var count int64
 	rng := rand.New(rand.NewSource(time.Now().UnixNano() + int64(id)))
 
-	rp.active.Add(1)
 	defer func() {
-		rp.active.Add(-1)
 		rp.logger.Printf("[reader-%d] done: %d objects in %v", id, count, time.Since(workerStart))
 	}()
 
@@ -188,7 +103,12 @@ func (rp *ReaderPool) worker(ctx context.Context, id int) {
 
 		item, ok := myDeque.PopFront()
 		if ok {
+			// working must cover the whole processing window: new work items
+			// are pushed while processing, so peers may not conclude the scan
+			// is drained until this item is fully handled.
+			rp.working.Add(1)
 			count += rp.processItem(ctx, id, myDeque, item)
+			rp.working.Add(-1)
 			continue
 		}
 
@@ -221,12 +141,17 @@ func (rp *ReaderPool) trySteal(myID int, myDeque *Deque, rng *rand.Rand) bool {
 	return false
 }
 
+// spinWaitForWork waits for new work to appear. It returns false — letting
+// the worker exit — only when the scan is provably drained: no worker is
+// processing an item (so nothing new can be pushed) and every deque is empty.
 func (rp *ReaderPool) spinWaitForWork(ctx context.Context, id int, myDeque *Deque, rng *rand.Rand) bool {
 	backoff := stealBackoffMin
-	deadline := time.Now().Add(stealGiveUpAfter)
 
-	for time.Now().Before(deadline) {
+	for {
 		if ctx.Err() != nil {
+			return false
+		}
+		if rp.working.Load() == 0 && rp.allDequesEmpty() {
 			return false
 		}
 		time.Sleep(backoff)
@@ -240,11 +165,7 @@ func (rp *ReaderPool) spinWaitForWork(ctx context.Context, id int, myDeque *Dequ
 		if rp.trySteal(id, myDeque, rng) {
 			return true
 		}
-		if rp.active.Load() <= 1 && rp.allDequesEmpty() {
-			return false
-		}
 	}
-	return false
 }
 
 func (rp *ReaderPool) allDequesEmpty() bool {
@@ -257,118 +178,128 @@ func (rp *ReaderPool) allDequesEmpty() bool {
 }
 
 func (rp *ReaderPool) processItem(ctx context.Context, id int, myDeque *Deque, item WorkItem) int64 {
-	// If this is a range-bounded work item, list it directly
-	if item.StartAfter != "" || item.EndBefore != "" {
+	// Range-bounded work items are bounded flat listings.
+	if item.StartAfter != "" || item.EndAt != "" {
 		return rp.listRange(ctx, id, item)
 	}
-
-	// Try to split into sub-prefixes for parallelism
-	if item.Depth < maxSplitDepth {
-		prefixes, err := rp.listPrefixes(ctx, item.Prefix)
-		if err == nil && len(prefixes) > 1 {
-			myDeque.PushBatch(prefixesToWorkItems(prefixes, item.Depth+1))
-			rp.logger.Printf("[reader-%d] split %q into %d sub-prefixes (depth=%d)",
-				id, item.Prefix, len(prefixes), item.Depth+1)
-			return 0
-		}
-	}
-
-	// Flat listing — but try range-splitting if it's huge
-	return rp.listFlatOrSplit(ctx, id, myDeque, item)
+	return rp.listLevel(ctx, id, myDeque, item)
 }
 
-// listFlatOrSplit lists the first page. If there are more pages (indicating a
-// large flat prefix), it samples evenly-spaced keys to create range-bounded
-// work items that other workers can steal.
-func (rp *ReaderPool) listFlatOrSplit(ctx context.Context, id int, myDeque *Deque, item WorkItem) int64 {
+// listLevel lists one prefix level with a delimiter: objects directly at this
+// level are emitted (exactly once), and each sub-prefix is pushed as a new
+// work item. If the first page shows a large flat prefix — truncated with no
+// sub-prefixes — the remainder is carved into range chunks that idle workers
+// steal, instead of one worker paginating it alone.
+func (rp *ReaderPool) listLevel(ctx context.Context, id int, myDeque *Deque, item WorkItem) int64 {
 	start := time.Now()
 	var count int64
 
-	// List first page
 	input := &s3.ListObjectsV2Input{
 		Bucket:  aws.String(rp.bucket),
 		Prefix:  aws.String(item.Prefix),
 		MaxKeys: aws.Int32(1000),
 	}
-	resp, err := rp.client.ListObjectsV2(ctx, input)
-	if err != nil {
-		rp.logger.Printf("[reader-%d] list error prefix=%q: %v", id, item.Prefix, err)
-		return 0
+	// Beyond the split-depth limit, list the whole subtree flat rather than
+	// recursing further; the flat path below still range-splits if it's huge.
+	useDelimiter := item.Depth < maxSplitDepth
+	if useDelimiter {
+		input.Delimiter = aws.String(delimiter)
 	}
 
-	recs := toRecords(resp.Contents)
-	rp.emitBatch(recs)
-	count += int64(len(recs))
-
-	// If there's no more data, we're done
-	if !aws.ToBool(resp.IsTruncated) {
-		if elapsed := time.Since(start); count > 1000 || elapsed > 2*time.Second {
-			rp.logger.Printf("[reader-%d] prefix=%q %d objects in %v", id, item.Prefix, count, elapsed)
-		}
-		return count
-	}
-
-	// There's more data. Try range-splitting to parallelize this flat prefix.
-	// Sample keys by skipping ahead with MaxKeys=1 at intervals.
-	markers := rp.sampleRangeMarkers(ctx, item.Prefix, rangeSplitFactor)
-	if len(markers) > 0 {
-		rp.logger.Printf("[reader-%d] range-split %q into %d chunks (sampled %d markers)",
-			id, item.Prefix, len(markers)+1, len(markers))
-
-		// Build range work items:
-		// chunk 0: StartAfter=lastKeyFromPage1, EndBefore=markers[0]
-		// chunk 1: StartAfter=markers[0], EndBefore=markers[1]
-		// ...
-		// chunk N: StartAfter=markers[N-1], EndBefore=""
-		lastKey := ""
-		if len(resp.Contents) > 0 {
-			lastKey = *resp.Contents[len(resp.Contents)-1].Key
-		}
-
-		var rangeItems []WorkItem
-		prev := lastKey
-		for _, m := range markers {
-			// Skip markers that aren't past our current position
-			if m <= prev {
-				continue
-			}
-			rangeItems = append(rangeItems, WorkItem{
-				Prefix:     item.Prefix,
-				StartAfter: prev,
-				EndBefore:  m,
-			})
-			prev = m
-		}
-		// Final open-ended chunk
-		rangeItems = append(rangeItems, WorkItem{
-			Prefix:     item.Prefix,
-			StartAfter: prev,
-		})
-
-		if len(rangeItems) > 1 {
-			myDeque.PushBatch(rangeItems)
+	var prefixes []string
+	firstPage := true
+	paginator := s3.NewListObjectsV2Paginator(rp.client, input)
+	for paginator.HasMorePages() {
+		if ctx.Err() != nil {
 			return count
 		}
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			rp.logger.Printf("[reader-%d] list error prefix=%q: %v", id, item.Prefix, err)
+			return count
+		}
+
+		recs := toRecords(page.Contents)
+		rp.emitBatch(recs)
+		count += int64(len(recs))
+
+		for _, cp := range page.CommonPrefixes {
+			if cp.Prefix != nil {
+				prefixes = append(prefixes, *cp.Prefix)
+			}
+		}
+
+		// Large flat prefix: no sub-prefixes on a full first page. Carve the
+		// tail into disjoint (StartAfter, EndAt] chunks and stop; the
+		// chunks cover everything after this page exactly once.
+		if firstPage && len(prefixes) == 0 && aws.ToBool(page.IsTruncated) && len(page.Contents) > 0 {
+			lastKey := aws.ToString(page.Contents[len(page.Contents)-1].Key)
+			if rangeItems := rp.buildRangeItems(ctx, item.Prefix, lastKey); len(rangeItems) > 1 {
+				myDeque.PushBatch(rangeItems)
+				rp.logger.Printf("[reader-%d] range-split %q into %d chunks after %q",
+					id, item.Prefix, len(rangeItems), lastKey)
+				return count
+			}
+			// Sampling found too few keys to be worth splitting — keep
+			// paginating sequentially.
+		}
+		firstPage = false
 	}
 
-	// Fallback: couldn't range-split, just continue listing sequentially
-	count += rp.listContinuation(ctx, id, item.Prefix, resp.NextContinuationToken, start)
+	if len(prefixes) > 0 {
+		myDeque.PushBatch(prefixesToWorkItems(prefixes, item.Depth+1))
+		rp.logger.Printf("[reader-%d] split %q into %d sub-prefixes (depth=%d)",
+			id, item.Prefix, len(prefixes), item.Depth+1)
+	}
+
+	if elapsed := time.Since(start); count > 1000 || elapsed > 2*time.Second {
+		rp.logger.Printf("[reader-%d] prefix=%q %d objects in %v", id, item.Prefix, count, elapsed)
+	}
 	return count
 }
 
-// sampleRangeMarkers uses a fast skip-ahead technique to find evenly-spaced
-// keys across a flat prefix. It issues N small requests with StartAfter to
-// probe the keyspace.
-func (rp *ReaderPool) sampleRangeMarkers(ctx context.Context, prefix string, n int) []string {
-	// First, estimate total count with a single request getting max keys
+// buildRangeItems samples marker keys beyond startAfter and turns them into
+// disjoint range work items that together cover (startAfter, end-of-prefix).
+func (rp *ReaderPool) buildRangeItems(ctx context.Context, prefix, startAfter string) []WorkItem {
+	markers := rp.sampleRangeMarkers(ctx, prefix, startAfter, rangeSplitFactor)
+	if len(markers) == 0 {
+		return nil
+	}
+
+	var items []WorkItem
+	prev := startAfter
+	for _, m := range markers {
+		if m <= prev {
+			continue
+		}
+		items = append(items, WorkItem{
+			Prefix:     prefix,
+			StartAfter: prev,
+			EndAt:      m,
+		})
+		prev = m
+	}
+	// Final open-ended chunk.
+	items = append(items, WorkItem{
+		Prefix:     prefix,
+		StartAfter: prev,
+	})
+	return items
+}
+
+// sampleRangeMarkers probes up to 10 pages beyond startAfter and picks
+// evenly-spaced keys to use as range boundaries. The sampled pages are only
+// read for their key names; the range workers do the actual emission.
+func (rp *ReaderPool) sampleRangeMarkers(ctx context.Context, prefix, startAfter string, n int) []string {
 	input := &s3.ListObjectsV2Input{
 		Bucket:  aws.String(rp.bucket),
 		Prefix:  aws.String(prefix),
 		MaxKeys: aws.Int32(1000),
 	}
+	if startAfter != "" {
+		input.StartAfter = aws.String(startAfter)
+	}
 
-	// Walk through pages to collect evenly-spaced markers.
-	// We'll list up to 10 pages (10K keys) and sample from what we find.
 	var allKeys []string
 	pages := 0
 	paginator := s3.NewListObjectsV2Paginator(rp.client, input)
@@ -405,38 +336,10 @@ func (rp *ReaderPool) sampleRangeMarkers(ctx context.Context, prefix string, n i
 	return markers
 }
 
-// listContinuation continues a paginated listing from a continuation token.
-func (rp *ReaderPool) listContinuation(ctx context.Context, id int, prefix string, token *string, start time.Time) int64 {
-	var count int64
-
-	paginator := s3.NewListObjectsV2Paginator(rp.client, &s3.ListObjectsV2Input{
-		Bucket:            aws.String(rp.bucket),
-		Prefix:            aws.String(prefix),
-		ContinuationToken: token,
-	})
-
-	for paginator.HasMorePages() {
-		if ctx.Err() != nil {
-			return count
-		}
-		page, err := paginator.NextPage(ctx)
-		if err != nil {
-			rp.logger.Printf("[reader-%d] list error prefix=%q: %v", id, prefix, err)
-			return count
-		}
-		recs := toRecords(page.Contents)
-		rp.emitBatch(recs)
-		count += int64(len(recs))
-	}
-
-	if elapsed := time.Since(start); count > 1000 || elapsed > 2*time.Second {
-		rp.logger.Printf("[reader-%d] prefix=%q %d objects in %v (continuation)", id, prefix, count, elapsed)
-	}
-	return count
-}
-
 // listRange lists objects in a bounded key range under a prefix.
-// Uses StartAfter and stops when hitting EndBefore.
+// Lists keys strictly after StartAfter, up to and including EndAt. Emitting
+// the boundary key here (and starting the next chunk strictly after it via
+// StartAfter) is what makes adjacent chunks partition the keyspace exactly.
 func (rp *ReaderPool) listRange(ctx context.Context, id int, item WorkItem) int64 {
 	start := time.Now()
 	var count int64
@@ -467,8 +370,11 @@ func (rp *ReaderPool) listRange(ctx context.Context, id int, item WorkItem) int6
 			if key == nil {
 				continue
 			}
-			// Stop if we've reached the end boundary
-			if item.EndBefore != "" && *key >= item.EndBefore {
+			// Stop at the end boundary, emitting the boundary key itself.
+			if item.EndAt != "" && *key >= item.EndAt {
+				if *key == item.EndAt {
+					recs = append(recs, toRecord(&page.Contents[i]))
+				}
 				rp.emitBatch(recs)
 				count += int64(len(recs))
 				if elapsed := time.Since(start); count > 1000 || elapsed > 2*time.Second {
@@ -488,6 +394,14 @@ func (rp *ReaderPool) listRange(ctx context.Context, id int, item WorkItem) int6
 			id, item.Prefix, count, elapsed)
 	}
 	return count
+}
+
+func prefixesToWorkItems(prefixes []string, depth int) []WorkItem {
+	items := make([]WorkItem, len(prefixes))
+	for i, p := range prefixes {
+		items[i] = WorkItem{Prefix: p, Depth: depth}
+	}
+	return items
 }
 
 // emitBatch sends a whole page of records downstream in one channel operation

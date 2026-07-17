@@ -7,7 +7,7 @@ type WorkItem struct {
 	Prefix     string
 	Depth      int
 	StartAfter string // if set, list only keys > StartAfter (for range splitting)
-	EndBefore  string // if set, stop listing when key >= EndBefore
+	EndAt      string // if set, stop after emitting this key (inclusive range end)
 }
 
 // Deque is a thread-safe double-ended queue for work stealing.
