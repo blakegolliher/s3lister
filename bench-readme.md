@@ -177,7 +177,7 @@ S3 endpoint, connections spread across all VIPs via DNS discovery:
 
 | Bucket | Objects | Wall time | Avg objs/s | Peak objs/s | Readers | Writers | Output size | Exactness |
 |--------|---------|-----------|------------|-------------|---------|---------|-------------|-----------|
-| bench-5m | 5,000,000 | 30.3s | 165,022 | 202,051 | 32 | 8 | 43.4 MiB | ✓ 5,000,000 |
+| bench-5m | 5,000,000 | 29.5s | 169,480 | 216,766 | 32 | 8 | 43.2 MiB | ✓ 5,000,000 |
 | bench-100m | 100,000,000 | — | — | — | — | — | — | pending |
 | bench-2b | 2,000,000,000 | — | — | — | — | — | — | pending |
 
