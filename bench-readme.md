@@ -106,6 +106,15 @@ Same three commands per tier — populate, scan, verify — for `bench-100m` and
   populate first.
 - **Endpoint unreachable / timeouts** — verify basic reachability with
   `curl -m 5 http://<endpoint>/` before debugging anything else.
+- **Burst of `connection reset by peer` PUT errors mid-populate** — many
+  simultaneous resets across several endpoint IPs is a server-side event:
+  VIPs migrating between nodes (failover or rebalance) reset every
+  established connection at once. Check the storage system's event log at
+  the error timestamp. The populator retries each key with backoff for
+  ~12s, which absorbs a normal failover; if keys still fail after retries
+  it aborts at 1,000 failed keys and prints a `-start` resume point that is
+  guaranteed to re-cover every failed key (chunks containing a failure
+  never leave the resume window).
 - **All load lands on one node** — check what DNS actually returns:
   `dig +short <endpoint>` a few times in a row.
   - *Same single IP every query*: the name is a static record pointing at one

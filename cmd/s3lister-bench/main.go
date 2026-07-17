@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"os"
 	"os/signal"
 	"sync"
@@ -34,6 +35,22 @@ var populateExts = []string{"log", "jpg", "json", "parquet", "csv", "bin", "txt"
 // enough that the resume watermark stays tight, large enough that the atomic
 // dispatch counter is never contended.
 const populateChunk = 1000
+
+// putAttempts and putBackoffMin shape the per-key retry loop on top of the
+// SDK's own retries. The SDK's client-side retry budget drains instantly
+// during a mass event (e.g. VIPs migrating between nodes reset every
+// connection at once), so without this layer a few seconds of cluster blip
+// becomes thousands of "failed" keys. Six attempts with exponential jittered
+// backoff spans roughly 12 seconds - enough to ride out a VIP failover.
+const (
+	putAttempts   = 6
+	putBackoffMin = 200 * time.Millisecond
+	putBackoffMax = 5 * time.Second
+)
+
+// maxFinalErrors aborts the run when this many keys have failed even after
+// per-key retries - at that point the outage is sustained, not transient.
+const maxFinalErrors = 1000
 
 // benchKey deterministically maps an object index to a key. The layout mixes:
 //   - hierarchical keys: data/dNNN/sNNN/obj-NNNNNNNNNNNN.ext — exercises
@@ -133,6 +150,7 @@ func main() {
 		flatPct:  *flatPct,
 		flatDirs: *flatDirs,
 		logger:   logger,
+		cancel:   cancel,
 		inflight: make(map[int64]struct{}),
 	}
 	p.next.Store(*start)
@@ -232,17 +250,18 @@ type populator struct {
 	flatPct  int64
 	flatDirs int64
 	logger   *log.Logger
+	cancel   context.CancelFunc // stops every worker when the error cap trips
 
 	next    atomic.Int64 // next unclaimed object index
 	created atomic.Int64
-	errors  atomic.Int64
+	errors  atomic.Int64 // keys that failed even after per-key retries
 
 	mu       sync.Mutex
 	inflight map[int64]struct{} // chunk start indices claimed but not finished
 }
 
 // worker claims chunks of indices and PUTs each key until the range is
-// exhausted, the context is cancelled, or too many errors accumulate.
+// exhausted, the context is cancelled, or too many keys fail outright.
 func (p *populator) worker(ctx context.Context) {
 	for {
 		if ctx.Err() != nil {
@@ -261,21 +280,26 @@ func (p *populator) worker(ctx context.Context) {
 		p.inflight[chunkStart] = struct{}{}
 		p.mu.Unlock()
 
+		failed := false
 		for i := chunkStart; i < chunkEnd; i++ {
 			if ctx.Err() != nil {
 				return // chunk stays in-flight → resume point stays safe
 			}
 			key := benchKey(i, p.d1, p.d2, p.flatPct, p.flatDirs)
-			if err := p.put(ctx, key); err != nil {
+			if err := p.putWithRetry(ctx, key); err != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				failed = true
 				n := p.errors.Add(1)
 				if n <= 20 {
-					p.logger.Printf("[populate] PUT error key=%s: %v", key, err)
+					p.logger.Printf("[populate] PUT failed after %d attempts key=%s: %v",
+						putAttempts, key, err)
 				}
-				if n == 1000 {
-					p.logger.Printf("[populate] too many errors, aborting")
-					fmt.Fprintf(os.Stderr, "\nToo many PUT errors (1000), aborting — see log\n")
-				}
-				if n >= 1000 {
+				if n == maxFinalErrors {
+					p.logger.Printf("[populate] %d keys failed despite retries, aborting", n)
+					fmt.Fprintf(os.Stderr, "\nToo many PUT failures (%d), aborting — see log\n", n)
+					p.cancel()
 					return
 				}
 				continue
@@ -283,10 +307,43 @@ func (p *populator) worker(ctx context.Context) {
 			p.created.Add(1)
 		}
 
-		p.mu.Lock()
-		delete(p.inflight, chunkStart)
-		p.mu.Unlock()
+		// A chunk leaves the resume window only if every key in it succeeded;
+		// chunks with failures stay in-flight so the printed -start provably
+		// re-covers every lost key.
+		if !failed {
+			p.mu.Lock()
+			delete(p.inflight, chunkStart)
+			p.mu.Unlock()
+		}
 	}
+}
+
+// putWithRetry layers exponential jittered backoff on top of the SDK's own
+// retries, so transient events (VIP failover, node restart) are absorbed
+// instead of surfacing as failed keys.
+func (p *populator) putWithRetry(ctx context.Context, key string) error {
+	backoff := putBackoffMin
+	var err error
+	for attempt := 0; attempt < putAttempts; attempt++ {
+		if attempt > 0 {
+			jitter := time.Duration(rand.Int63n(int64(backoff)))
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(backoff + jitter):
+			}
+			if backoff < putBackoffMax {
+				backoff *= 2
+			}
+		}
+		if err = p.put(ctx, key); err == nil {
+			return nil
+		}
+		if ctx.Err() != nil {
+			return err
+		}
+	}
+	return err
 }
 
 func (p *populator) put(ctx context.Context, key string) error {
