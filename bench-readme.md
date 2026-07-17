@@ -181,6 +181,11 @@ S3 endpoint, connections spread across all VIPs via DNS discovery:
 | bench-100m | 100,000,000 | 5m28s | 304,762 | 455,376 | 32 | 8 | 880.6 MiB | ✓ 100,000,000 |
 | bench-2b | 2,000,000,000 | — | — | — | — | — | — | pending |
 
+Exactness is `count(*) == count(DISTINCT key) == objects populated`, checked
+with DuckDB directly against the Parquet output. The check itself shows off
+the format: the 100M-row distinct count completes in ~7 seconds on the
+client VM, no import step, from 880 MiB of Parquet.
+
 ## Reporting
 
 For published numbers, record alongside the objects/sec figure:
