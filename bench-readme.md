@@ -92,6 +92,38 @@ object listed exactly once, no duplicates, no gaps. (No duckdb on the box?
 Same three commands per tier — populate, scan, verify — for `bench-100m` and
 `bench-2b`.
 
+## Repairing a populate that finished with errors
+
+If a run ends with `N errors`, that many keys are missing from the bucket
+and the exactness check will come up short by exactly N. Every key that
+failed all retries is appended to the sidecar file (default
+`./s3lister-bench.failed`), and keys embed their object index, so the repair
+is to re-PUT precisely those indices — `-start i -count i+1` writes a single
+key:
+
+```bash
+grep -o '[0-9]\{12\}' s3lister-bench.failed | while read i; do
+  ./s3lister-bench -bucket bench-2b -count $((10#$i + 1)) -start $((10#$i)) -workers 1
+done
+```
+
+No sidecar file (older binary)? The keyspace is deterministic, so DuckDB can
+compute the missing indices from a scan of the bucket:
+
+```sql
+SET temp_directory='/path/with/room';   -- 2B-row anti-join spills to disk
+COPY (
+  SELECT i FROM range(0, 2000000000) t(i)
+  WHERE NOT EXISTS (
+    SELECT 1 FROM read_parquet('./out-2b/*.parquet') p
+    WHERE CAST(regexp_extract(p.key, '(\d{12})', 1) AS BIGINT) = t.i
+  )
+) TO 'missing.txt' (HEADER false);
+```
+
+Feed `missing.txt` through the same loop, then re-scan for the verified
+result.
+
 ## Troubleshooting
 
 - **`tls: failed to verify certificate: x509: certificate is valid for

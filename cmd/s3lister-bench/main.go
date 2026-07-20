@@ -85,6 +85,7 @@ func main() {
 	flatPct := fs.Int64("flat-pct", 10, "percent of objects placed in large flat prefixes (0-100)")
 	flatDirs := fs.Int64("flat-dirs", 16, "number of flat prefixes")
 	logPath := fs.String("log", "./s3lister-bench.log", "log file path")
+	failedPath := fs.String("failed-keys", "./s3lister-bench.failed", "file recording every key that failed after all retries")
 	verbose := fs.Bool("verbose", false, "verbose output: log to stderr")
 	fs.Parse(os.Args[1:])
 
@@ -141,18 +142,20 @@ func main() {
 	}
 
 	p := &populator{
-		client:   client,
-		bucket:   *bucket,
-		body:     body,
-		end:      *count,
-		d1:       *dirs1,
-		d2:       *dirs2,
-		flatPct:  *flatPct,
-		flatDirs: *flatDirs,
-		logger:   logger,
-		cancel:   cancel,
-		inflight: make(map[int64]struct{}),
+		client:     client,
+		bucket:     *bucket,
+		body:       body,
+		end:        *count,
+		d1:         *dirs1,
+		d2:         *dirs2,
+		flatPct:    *flatPct,
+		flatDirs:   *flatDirs,
+		logger:     logger,
+		cancel:     cancel,
+		failedPath: *failedPath,
+		inflight:   make(map[int64]struct{}),
 	}
+	defer p.closeFailedKeys()
 	p.next.Store(*start)
 
 	totalStart := time.Now()
@@ -190,6 +193,13 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Interrupted. %d objects PUT in %v (%.0f/s), %d errors\n",
 			created, elapsed.Round(time.Second), rate, errCount)
 		fmt.Fprintf(os.Stderr, "Resume with:  -start %d\n", resume)
+		if errCount > 0 {
+			p.closeFailedKeys()
+			fmt.Fprintf(os.Stderr, "Failed keys recorded in:  %s\n", *failedPath)
+			fmt.Fprintf(os.Stderr, "Re-PUT just those (instead of resuming) with:\n")
+			fmt.Fprintf(os.Stderr, "  grep -o '[0-9]\\{12\\}' %s | while read i; do %s -bucket %s -count $((10#$i + 1)) -start $((10#$i)) -workers 1; done\n",
+				*failedPath, os.Args[0], *bucket)
+		}
 		os.Exit(1)
 	}
 
@@ -256,8 +266,40 @@ type populator struct {
 	created atomic.Int64
 	errors  atomic.Int64 // keys that failed even after per-key retries
 
-	mu       sync.Mutex
-	inflight map[int64]struct{} // chunk start indices claimed but not finished
+	mu         sync.Mutex
+	inflight   map[int64]struct{} // chunk start indices claimed but not finished
+	failedPath string             // sidecar file for finally-failed keys ("" = disabled)
+	failedF    *os.File           // opened lazily on first failure
+}
+
+// recordFailedKey appends a finally-failed key to the sidecar file so the
+// exact set of missing objects survives the run (the log only samples the
+// first few). The file is created lazily so clean runs leave nothing behind.
+func (p *populator) recordFailedKey(key string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.failedPath == "" {
+		return
+	}
+	if p.failedF == nil {
+		f, err := os.OpenFile(p.failedPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+		if err != nil {
+			p.logger.Printf("[populate] cannot open failed-keys file %s: %v", p.failedPath, err)
+			p.failedPath = ""
+			return
+		}
+		p.failedF = f
+	}
+	fmt.Fprintln(p.failedF, key)
+}
+
+func (p *populator) closeFailedKeys() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.failedF != nil {
+		p.failedF.Close()
+		p.failedF = nil
+	}
 }
 
 // worker claims chunks of indices and PUTs each key until the range is
@@ -291,6 +333,7 @@ func (p *populator) worker(ctx context.Context) {
 					return
 				}
 				failed = true
+				p.recordFailedKey(key)
 				n := p.errors.Add(1)
 				if n <= 20 {
 					p.logger.Printf("[populate] PUT failed after %d attempts key=%s: %v",
