@@ -217,16 +217,27 @@ func runScan(args []string) {
 	totalElapsed := time.Since(totalStart)
 	totalObjects := writerPool.Written()
 	writeErrors := writerPool.Errors()
+	listErrors := readerPool.ListErrors()
 	avgRate := float64(totalObjects) / totalElapsed.Seconds()
 	peakRate := meter.PeakRate()
 	outBytes, outFiles := dirSize(cfg.Storage.OutputDir)
 
 	logger.Printf("=== scan complete ===")
-	logger.Printf("stats: scan_id=%s objects=%d errors=%d elapsed=%v avg_rate=%.0f/s peak_rate=%.0f/s",
-		scanID, totalObjects, writeErrors, totalElapsed, avgRate, peakRate)
+	logger.Printf("stats: scan_id=%s objects=%d write_errors=%d list_errors=%d elapsed=%v avg_rate=%.0f/s peak_rate=%.0f/s",
+		scanID, totalObjects, writeErrors, listErrors, totalElapsed, avgRate, peakRate)
 	logger.Printf("stats: readers=%d writers=%d output_files=%d output_bytes=%d (%s) bytes_per_object=%.1f",
 		cfg.Workers.Readers, cfg.Workers.Writers, outFiles, outBytes, humanBytes(outBytes),
 		safeDiv(float64(outBytes), float64(totalObjects)))
+
+	if listErrors > 0 {
+		fmt.Fprintf(os.Stderr, "\nSCAN INCOMPLETE! %d listing failure(s) — parts of the bucket were NOT listed.\n", listErrors)
+		fmt.Fprintf(os.Stderr, "  %d objects written in %v, but the dataset is missing keyspace.\n",
+			totalObjects, totalElapsed.Round(time.Millisecond))
+		fmt.Fprintf(os.Stderr, "  Grep the log for ABANDONED to see which prefixes/ranges were lost,\n")
+		fmt.Fprintf(os.Stderr, "  resolve the endpoint issue, and re-run the scan.\n")
+		fmt.Fprintf(os.Stderr, "  log: %s\n", cfg.Logging.LogFile)
+		os.Exit(1)
+	}
 
 	fmt.Fprintf(os.Stderr, "\nDone! %d objects in %v\n", totalObjects, totalElapsed.Round(time.Millisecond))
 	fmt.Fprintf(os.Stderr, "  avg %.0f/s   peak %.0f/s\n", avgRate, peakRate)

@@ -21,6 +21,13 @@ const (
 	delimiter       = "/"
 	// How many range chunks to split a large flat prefix into.
 	rangeSplitFactor = 8
+	// Per-page retry policy layered on top of the SDK's own retries. A VIP
+	// failover resets every connection at once and drains the SDK's retry
+	// budget; without this layer one transient event silently truncates every
+	// work item it touches.
+	listAttempts   = 6
+	listBackoffMin = 200 * time.Millisecond
+	listBackoffMax = 5 * time.Second
 )
 
 // ReaderPool fans out S3 listing with true work-stealing.
@@ -40,6 +47,47 @@ type ReaderPool struct {
 	logger  *log.Logger
 	deques  []*Deque
 	working atomic.Int32 // workers currently processing an item
+
+	// listErrors counts work items abandoned after all page retries failed.
+	// Any non-zero value means the scan is INCOMPLETE: some slice of the
+	// keyspace was never listed. Callers must surface this loudly.
+	listErrors atomic.Int64
+}
+
+// ListErrors returns the number of work items abandoned due to persistent
+// listing failures. Non-zero means the output is missing part of the bucket.
+func (rp *ReaderPool) ListErrors() int64 {
+	return rp.listErrors.Load()
+}
+
+// nextPageWithRetry fetches the next page, retrying with exponential jittered
+// backoff. The paginator only advances its continuation token on success, so
+// retrying NextPage re-requests the same page.
+func (rp *ReaderPool) nextPageWithRetry(ctx context.Context, paginator *s3.ListObjectsV2Paginator) (*s3.ListObjectsV2Output, error) {
+	backoff := listBackoffMin
+	var err error
+	for attempt := 0; attempt < listAttempts; attempt++ {
+		if attempt > 0 {
+			jitter := time.Duration(rand.Int63n(int64(backoff)))
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(backoff + jitter):
+			}
+			if backoff < listBackoffMax {
+				backoff *= 2
+			}
+		}
+		var page *s3.ListObjectsV2Output
+		page, err = paginator.NextPage(ctx)
+		if err == nil {
+			return page, nil
+		}
+		if ctx.Err() != nil {
+			return nil, err
+		}
+	}
+	return nil, err
 }
 
 func NewReaderPool(client *s3.Client, bucket, prefix string, workers int, out chan<- []model.ObjectRecord, logger *log.Logger) *ReaderPool {
@@ -213,9 +261,13 @@ func (rp *ReaderPool) listLevel(ctx context.Context, id int, myDeque *Deque, ite
 		if ctx.Err() != nil {
 			return count
 		}
-		page, err := paginator.NextPage(ctx)
+		page, err := rp.nextPageWithRetry(ctx, paginator)
 		if err != nil {
-			rp.logger.Printf("[reader-%d] list error prefix=%q: %v", id, item.Prefix, err)
+			if ctx.Err() == nil {
+				rp.listErrors.Add(1)
+				rp.logger.Printf("[reader-%d] ABANDONED prefix=%q after %d attempts (scan incomplete): %v",
+					id, item.Prefix, listAttempts, err)
+			}
 			return count
 		}
 
@@ -304,7 +356,9 @@ func (rp *ReaderPool) sampleRangeMarkers(ctx context.Context, prefix, startAfter
 	pages := 0
 	paginator := s3.NewListObjectsV2Paginator(rp.client, input)
 	for paginator.HasMorePages() && pages < 10 {
-		page, err := paginator.NextPage(ctx)
+		// A sampling failure is not a data-loss path — the caller falls back
+		// to sequential pagination — so no listErrors here.
+		page, err := rp.nextPageWithRetry(ctx, paginator)
 		if err != nil {
 			return nil
 		}
@@ -359,9 +413,13 @@ func (rp *ReaderPool) listRange(ctx context.Context, id int, item WorkItem) int6
 		if ctx.Err() != nil {
 			return count
 		}
-		page, err := paginator.NextPage(ctx)
+		page, err := rp.nextPageWithRetry(ctx, paginator)
 		if err != nil {
-			rp.logger.Printf("[reader-%d] range list error prefix=%q: %v", id, item.Prefix, err)
+			if ctx.Err() == nil {
+				rp.listErrors.Add(1)
+				rp.logger.Printf("[reader-%d] ABANDONED range prefix=%q after=%q after %d attempts (scan incomplete): %v",
+					id, item.Prefix, item.StartAfter, listAttempts, err)
+			}
 			return count
 		}
 		recs := make([]model.ObjectRecord, 0, len(page.Contents))
