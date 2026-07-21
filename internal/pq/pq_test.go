@@ -94,6 +94,56 @@ func TestWriteReadRoundTrip(t *testing.T) {
 	}
 }
 
+func TestTagsThreeState(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "part-000.parquet")
+
+	recs := []model.ObjectRecord{
+		{Key: "a/no-collect"},                       // tags not collected -> NULL / -1
+		{Key: "a/no-tags", Tags: map[string]string{}}, // collected, none -> 0
+		{Key: "a/tagged", Tags: map[string]string{"env": "prod", "team": "storage"}},
+	}
+
+	w, err := NewWriter(path, "scan-test", time.Unix(0, 0).UTC())
+	if err != nil {
+		t.Fatalf("NewWriter: %v", err)
+	}
+	if _, err := w.Append(recs); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	fi, _ := f.Stat()
+	pf, err := parquet.OpenFile(f, fi.Size())
+	if err != nil {
+		t.Fatalf("OpenFile: %v", err)
+	}
+
+	r := parquet.NewGenericReader[Row](pf)
+	defer r.Close()
+	got := make([]Row, len(recs))
+	if rn, err := r.Read(got); rn != len(recs) {
+		t.Fatalf("read %d rows, want %d (err=%v)", rn, len(recs), err)
+	}
+
+	if got[0].TagCount != -1 || len(got[0].Tags) != 0 {
+		t.Errorf("not-collected row: tag_count=%d tags=%v, want -1 and empty", got[0].TagCount, got[0].Tags)
+	}
+	if got[1].TagCount != 0 || len(got[1].Tags) != 0 {
+		t.Errorf("no-tags row: tag_count=%d tags=%v, want 0 and empty", got[1].TagCount, got[1].Tags)
+	}
+	if got[2].TagCount != 2 || got[2].Tags["env"] != "prod" || got[2].Tags["team"] != "storage" {
+		t.Errorf("tagged row round-trip wrong: tag_count=%d tags=%v", got[2].TagCount, got[2].Tags)
+	}
+}
+
 func TestRowGroupFlushBoundsMemory(t *testing.T) {
 	// Write more than one row group's worth to exercise the auto-flush path.
 	dir := t.TempDir()

@@ -40,8 +40,14 @@ type Row struct {
 	LastModified  time.Time `parquet:"last_modified,timestamp(microsecond)"`
 	ETag          string    `parquet:"etag"`
 	StorageClass  string    `parquet:"storage_class"`
-	ScanID        string    `parquet:"scan_id"`
-	ScanTimestamp time.Time `parquet:"scan_timestamp,timestamp(microsecond)"`
+	// Tags is a Parquet MAP column filled by the opt-in tag-collection stage.
+	// TagCount disambiguates its three states: -1 = tags were not collected
+	// for this row (no -tags flag, or the fetch failed after retries),
+	// 0 = collected and the object has none, N = collected with N tags.
+	Tags          map[string]string `parquet:"tags,optional"`
+	TagCount      int32             `parquet:"tag_count"`
+	ScanID        string            `parquet:"scan_id"`
+	ScanTimestamp time.Time         `parquet:"scan_timestamp,timestamp(microsecond)"`
 }
 
 // Writer wraps a single Parquet output file. It is NOT safe for concurrent use;
@@ -125,6 +131,11 @@ func deriveRow(r *model.ObjectRecord, scanID string, scanTS time.Time) Row {
 		ext = name[dot+1:]
 	}
 
+	tagCount := int32(-1)
+	if r.Tags != nil {
+		tagCount = int32(len(r.Tags))
+	}
+
 	return Row{
 		Key:           r.Key,
 		ObjectName:    name,
@@ -135,6 +146,8 @@ func deriveRow(r *model.ObjectRecord, scanID string, scanTS time.Time) Row {
 		LastModified:  r.LastModified,
 		ETag:          strings.Trim(r.ETag, `"`),
 		StorageClass:  r.StorageClass,
+		Tags:          r.Tags,
+		TagCount:      tagCount,
 		ScanID:        scanID,
 		ScanTimestamp: scanTS,
 	}

@@ -20,6 +20,8 @@ type WorkersConfig struct {
 	Readers   int `toml:"readers"`
 	Writers   int `toml:"writers"`
 	QueueSize int `toml:"queue_size"`
+	// TagWorkers sizes the GetObjectTagging pool used by `scan -tags`.
+	TagWorkers int `toml:"tag_workers"`
 }
 
 type StorageConfig struct {
@@ -76,6 +78,7 @@ func (c *Config) validate() error {
 	c.Workers.Readers = clampDefault(c.Workers.Readers, 1, 512, 32)
 	c.Workers.Writers = clampDefault(c.Workers.Writers, 1, 128, 8)
 	c.Workers.QueueSize = clampDefault(c.Workers.QueueSize, 1000, 10_000_000, 100_000)
+	c.Workers.TagWorkers = clampDefault(c.Workers.TagWorkers, 1, 4096, 256)
 
 	if c.Storage.OutputDir == "" {
 		c.Storage.OutputDir = "./s3lister_out"

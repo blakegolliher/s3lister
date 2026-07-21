@@ -16,6 +16,8 @@ billions of objects.
   Spark, ClickHouse.
 - **Analytics-ready schema**: precomputed `object_name`, `extension`,
   `parent_prefix`, and `depth` columns give predicate pushdown for free.
+- **Object tags (opt-in)**: `scan -tags` fetches every object's tags into a
+  queryable `tags` map column — `WHERE tags['env'] = 'prod'` in DuckDB.
 - **Work-stealing parallelism**: idle readers steal work; huge flat prefixes are
   range-split so no single worker becomes a straggler.
 - **Live progress bar** with throughput and elapsed time; queue depth and
@@ -82,10 +84,14 @@ the results as Parquet part files into the output directory.
 ./s3lister scan [options]
 
 Options:
-  -config string   Path to config file (default "config.toml")
-  -readers int     Override number of reader threads
-  -writers int     Override number of writer threads
-  -verbose         Log to stderr and trace HTTP requests
+  -config string      Path to config file (default "config.toml")
+  -readers int        Override number of reader threads
+  -writers int        Override number of writer threads
+  -bucket string      Override bucket from config
+  -output string      Override output directory from config
+  -tags               Also fetch every object's tags (see below)
+  -tag-workers int    Override number of tag-fetch workers (with -tags)
+  -verbose            Log to stderr and trace HTTP requests
 ```
 
 Progress is shown as a live bar on the terminal; a status line is also written
@@ -94,6 +100,28 @@ file, so `-writers 8` yields `part-000.parquet` … `part-007.parquet`.
 
 Each run starts fresh: existing `part-*.parquet` files in the output directory
 are removed before the scan begins.
+
+#### Object tags (`-tags`)
+
+S3 does not return tags in listings — they require a separate
+`GetObjectTagging` call **per object**, a ~1000× request amplification over
+listing. That's why tags are opt-in: with `-tags`, a pool of tag-fetch
+workers (`tag_workers`, default 256) sits between the listers and the Parquet
+writers, and the scan runs at tag-fetch speed rather than listing speed.
+Expect roughly `tag_workers ÷ per-request latency` objects/sec, and on AWS a
+per-request cost (~$0.40 per million objects). Scoping with `prefix` limits
+the cost to the subtree you care about.
+
+The output gains two columns: `tags`, a native Parquet map, and `tag_count`,
+which disambiguates its states — `-1` tags not collected (scan without
+`-tags`, or that object's fetch failed after retries; failures are counted,
+logged per key, and make the scan exit non-zero), `0` object has no tags,
+`N` object has N tags.
+
+```sql
+SELECT key, size_bytes FROM 'out/*.parquet'
+WHERE key LIKE 'foofiles/%' AND tags['foo'] IS NOT NULL;
+```
 
 ### `export-csv`
 
@@ -148,6 +176,8 @@ histograms, duplicate detection by ETag, cross-scan diffs, and more).
 | `last_modified` | TIMESTAMP | Last-modified time (UTC) |
 | `etag` | VARCHAR | ETag, quotes stripped |
 | `storage_class` | VARCHAR | e.g. `STANDARD`, `GLACIER` |
+| `tags` | MAP(VARCHAR, VARCHAR) | Object tags (only populated by `scan -tags`) |
+| `tag_count` | INTEGER | `-1` = not collected, `0` = none, `N` = tag count |
 | `scan_id` | VARCHAR | Identifier of the scan run |
 | `scan_timestamp` | TIMESTAMP | When the scan started (UTC) |
 
@@ -163,9 +193,10 @@ prefix     = ""              # empty = whole bucket
 region     = "us-east-1"
 
 [workers]
-readers    = 32              # goroutines listing S3 (ListObjectsV2)
-writers    = 8              # goroutines writing Parquet (one file each)
-queue_size = 100000         # records buffered between readers and writers
+readers     = 32             # goroutines listing S3 (ListObjectsV2)
+writers     = 8              # goroutines writing Parquet (one file each)
+queue_size  = 100000         # records buffered between readers and writers
+tag_workers = 256            # goroutines fetching tags (only with scan -tags)
 
 [storage]
 output_dir = "./s3lister_out"   # receives the part-NNN.parquet files

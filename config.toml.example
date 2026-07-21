@@ -15,6 +15,9 @@ readers = 32
 writers = 8
 # Records buffered between readers and writers (back-pressure knob)
 queue_size = 100000
+# Goroutines fetching object tags when `scan -tags` is used
+# (one GetObjectTagging call per object)
+tag_workers = 256
 
 [storage]
 # Directory that receives the part-NNN.parquet files.

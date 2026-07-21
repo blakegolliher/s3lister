@@ -95,6 +95,8 @@ func runScan(args []string) {
 	writers := fs.Int("writers", 0, "override number of writer threads")
 	bucket := fs.String("bucket", "", "override bucket from config")
 	output := fs.String("output", "", "override output directory from config")
+	tags := fs.Bool("tags", false, "also fetch every object's tags into the output (one GetObjectTagging call per object — expect the scan to run at tag-fetch speed, not listing speed)")
+	tagWorkers := fs.Int("tag-workers", 0, "override number of tag-fetch workers (with -tags)")
 	verbose := fs.Bool("verbose", false, "verbose output: log to stderr and trace HTTP requests")
 	fs.Parse(args)
 
@@ -114,14 +116,18 @@ func runScan(args []string) {
 	if *output != "" {
 		cfg.Storage.OutputDir = *output
 	}
+	if *tagWorkers > 0 {
+		cfg.Workers.TagWorkers = *tagWorkers
+	}
 
 	logger, _, logFile := setupLogger(cfg.Logging.LogFile, *verbose)
 	defer logFile.Close()
 
 	logger.Printf("=== s3lister scan starting ===")
-	logger.Printf("config: bucket=%s prefix=%q endpoint=%s readers=%d writers=%d queue=%d output=%s",
+	logger.Printf("config: bucket=%s prefix=%q endpoint=%s readers=%d writers=%d queue=%d output=%s tags=%v tag_workers=%d",
 		cfg.S3.Bucket, cfg.S3.Prefix, cfg.S3.Endpoint,
-		cfg.Workers.Readers, cfg.Workers.Writers, cfg.Workers.QueueSize, cfg.Storage.OutputDir)
+		cfg.Workers.Readers, cfg.Workers.Writers, cfg.Workers.QueueSize, cfg.Storage.OutputDir,
+		*tags, cfg.Workers.TagWorkers)
 
 	totalStart := time.Now()
 	scanID := fmt.Sprintf("scan-%s", totalStart.UTC().Format("20060102T150405Z"))
@@ -167,12 +173,27 @@ func runScan(args []string) {
 	}
 	recordCh := make(chan []model.ObjectRecord, chanCap)
 
-	writerPool := worker.NewWriterPool(cfg.Storage.OutputDir, scanID, scanTS, recordCh, cfg.Workers.Writers, logger)
+	// With -tags, a tagger stage sits between readers and writers, enriching
+	// each record via GetObjectTagging before it reaches the Parquet writers.
+	// The tagger closes its output channel once the readers' channel drains,
+	// so the shutdown sequence below is unchanged either way.
+	writerIn := recordCh
+	var taggerPool *worker.TaggerPool
+	if *tags {
+		taggedCh := make(chan []model.ObjectRecord, chanCap)
+		taggerPool = worker.NewTaggerPool(client, cfg.S3.Bucket, cfg.Workers.TagWorkers, recordCh, taggedCh, logger)
+		writerIn = taggedCh
+	}
+
+	writerPool := worker.NewWriterPool(cfg.Storage.OutputDir, scanID, scanTS, writerIn, cfg.Workers.Writers, logger)
 	writerDone := make(chan struct{})
 	go func() {
 		writerPool.Run()
 		close(writerDone)
 	}()
+	if taggerPool != nil {
+		go taggerPool.Run(ctx)
+	}
 
 	readerPool := worker.NewReaderPool(client, cfg.S3.Bucket, cfg.S3.Prefix, cfg.Workers.Readers, recordCh, logger)
 
@@ -222,9 +243,18 @@ func runScan(args []string) {
 	peakRate := meter.PeakRate()
 	outBytes, outFiles := dirSize(cfg.Storage.OutputDir)
 
+	var tagErrors int64
+	if taggerPool != nil {
+		tagErrors = taggerPool.TagErrors()
+	}
+
 	logger.Printf("=== scan complete ===")
 	logger.Printf("stats: scan_id=%s objects=%d write_errors=%d list_errors=%d elapsed=%v avg_rate=%.0f/s peak_rate=%.0f/s",
 		scanID, totalObjects, writeErrors, listErrors, totalElapsed, avgRate, peakRate)
+	if taggerPool != nil {
+		logger.Printf("stats: tagged=%d tag_errors=%d tag_workers=%d",
+			taggerPool.Tagged(), tagErrors, cfg.Workers.TagWorkers)
+	}
 	logger.Printf("stats: readers=%d writers=%d output_files=%d output_bytes=%d (%s) bytes_per_object=%.1f",
 		cfg.Workers.Readers, cfg.Workers.Writers, outFiles, outBytes, humanBytes(outBytes),
 		safeDiv(float64(outBytes), float64(totalObjects)))
@@ -239,9 +269,20 @@ func runScan(args []string) {
 		os.Exit(1)
 	}
 
+	if tagErrors > 0 {
+		fmt.Fprintf(os.Stderr, "\nTAGS INCOMPLETE! %d object(s) have NULL tags (tag_count = -1) after all retries.\n", tagErrors)
+		fmt.Fprintf(os.Stderr, "  The listing itself is complete; only those rows' tags are missing.\n")
+		fmt.Fprintf(os.Stderr, "  Grep the log for 'TAG FAILED' to see which keys, then re-run if needed.\n")
+		fmt.Fprintf(os.Stderr, "  log: %s\n", cfg.Logging.LogFile)
+		os.Exit(1)
+	}
+
 	fmt.Fprintf(os.Stderr, "\nDone! %d objects in %v\n", totalObjects, totalElapsed.Round(time.Millisecond))
 	fmt.Fprintf(os.Stderr, "  avg %.0f/s   peak %.0f/s\n", avgRate, peakRate)
 	fmt.Fprintf(os.Stderr, "  output: %s  (%d files, %s)\n", cfg.Storage.OutputDir, outFiles, humanBytes(outBytes))
+	if taggerPool != nil {
+		fmt.Fprintf(os.Stderr, "  tags: fetched for all %d objects\n", taggerPool.Tagged())
+	}
 	if writeErrors > 0 {
 		fmt.Fprintf(os.Stderr, "  WARNING: %d write errors occurred, check log\n", writeErrors)
 	}

@@ -14,4 +14,9 @@ type ObjectRecord struct {
 	LastModified time.Time
 	ETag         string
 	StorageClass string
+
+	// Tags is nil when tag collection is off (or the fetch failed) and
+	// non-nil — possibly empty — when GetObjectTagging succeeded. The
+	// nil/empty distinction is meaningful and flows through to the output.
+	Tags map[string]string
 }

@@ -38,8 +38,46 @@ predicate/statistics pushdown instead of per-row string parsing.
 | `last_modified` | TIMESTAMP | Object last-modified time (UTC) |
 | `etag` | VARCHAR | Object ETag, quotes stripped |
 | `storage_class` | VARCHAR | e.g. `STANDARD`, `GLACIER` (endpoint-dependent) |
+| `tags` | MAP(VARCHAR, VARCHAR) | Object tags (only populated by `scan -tags`) |
+| `tag_count` | INTEGER | `-1` = tags not collected, `0` = object has none, `N` = tag count |
 | `scan_id` | VARCHAR | Identifier for the scan run, e.g. `scan-20260714T153000Z` |
 | `scan_timestamp` | TIMESTAMP | When the scan started (UTC) |
+
+## Object Tags
+
+Requires a scan run with `-tags`. `tags` is a native Parquet map: `tags['x']`
+returns the value, or NULL when the tag is absent (so it doubles as an
+existence test). `tag_count` distinguishes "no tags" (`0`) from "tags were
+not collected for this row" (`-1`).
+
+```sql
+-- Objects with a tag named 'foo', under one prefix
+SELECT key, size_bytes
+FROM objects
+WHERE key LIKE 'foofiles/%' AND tags['foo'] IS NOT NULL;
+
+-- Objects tagged env=prod
+SELECT key, size_bytes
+FROM objects
+WHERE tags['env'] = 'prod';
+
+-- Explode tags into (key, tag, value) rows
+SELECT key, unnest(map_entries(tags)) AS tag
+FROM objects
+WHERE tag_count > 0;
+
+-- Tag usage: which tag names exist, how often, how much data they cover
+SELECT t.key AS tag_name, count(*) AS objects,
+       round(sum(size_bytes) / 1e9, 2) AS size_gb
+FROM objects, unnest(map_entries(tags)) AS u(t)
+GROUP BY tag_name
+ORDER BY objects DESC;
+
+-- Untagged data (candidates for cleanup policies)
+SELECT count(*) AS untagged_objects, round(sum(size_bytes) / 1e9, 2) AS size_gb
+FROM objects
+WHERE tag_count = 0;
+```
 
 ## Overview Statistics
 
