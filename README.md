@@ -18,23 +18,25 @@ billions of objects.
   `parent_prefix`, and `depth` columns give predicate pushdown for free.
 - **Work-stealing parallelism**: idle readers steal work; huge flat prefixes are
   range-split so no single worker becomes a straggler.
-- **Live progress bar** with throughput, queue depth, and elapsed time, plus a
-  detailed stats block written to a log file.
+- **Live progress bar** with throughput and elapsed time; queue depth and
+  per-worker detail go to the log file, along with a final stats block.
 - **Pure Go**: no CGO, no external services.
 
 ## Example
 
-```
-[bg@chewbacca s3lister]$ ./s3lister scan -config ./config.toml
-⠹ [░░░░░░░░░█▓░░░░░░░░░░░░░░░░░]  385,061,524 objs  30,193/s  3h32m33s
+A real run against a bucket with two billion objects:
 
-Done! 385061524 objects in 3h32m36s
-  avg 30185/s   peak 34011/s
-  output: ./s3lister_out  (8 files, 6.2 GiB)
+```
+$ ./s3lister scan -config ./config.toml -bucket bench-2b -output ./out-2b -readers 64
+⠴ 5,557,064 objs  412,166/s  15s
+
+Done! 2000000000 objects in 1h20m33.261s
+  avg 413799/s   peak 733128/s
+  output: ./out-2b  (8 files, 17.0 GiB)
   log: ./s3lister.log
 
 Query it with DuckDB:
-  duckdb -c "SELECT count(*), sum(size_bytes) FROM './s3lister_out/*.parquet'"
+  duckdb -c "SELECT count(*), sum(size_bytes) FROM './out-2b/*.parquet'"
 ```
 
 ## Download
@@ -183,7 +185,24 @@ how to reproduce the numbers yourself.
 
 ## Performance
 
-Tuning notes:
+### Measured
+
+Scans from a single Ubuntu client VM against a 6-VIP S3 endpoint, connections
+spread across all VIPs by DNS discovery. Every result is DuckDB-verified
+exact: `count(*) == count(DISTINCT key) ==` the number of objects populated.
+
+| Objects | Wall time | Avg objs/s | Peak objs/s | Parquet on disk |
+|---------|-----------|------------|-------------|-----------------|
+| 5,000,000 | 17.7s | 282,006 | 338,312 | 43.5 MiB |
+| 100,000,000 | 5m28s | 304,762 | 455,376 | 880.6 MiB |
+| 2,000,000,000 | 1h20m33s | 413,799 | 733,128 | 17.0 GiB |
+
+Throughput rises with scale — a larger keyspace gives the work-stealing
+scheduler more parallelism to exploit — and the output stays ~9 bytes per
+object. Methodology, tuning, and full reproduction steps:
+[bench-readme.md](bench-readme.md).
+
+### Tuning notes
 
 - **Readers** are network-bound. On high-latency or high-object-count buckets,
   more readers means more in-flight `ListObjectsV2` requests. 32–128 is typical;
