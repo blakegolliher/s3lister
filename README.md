@@ -113,12 +113,12 @@ calls and behaves exactly as it always has (every row gets `tags = NULL`,
 ```
 
 Why opt-in: S3 does not return tags in listings — they require a separate
-`GetObjectTagging` call **per object**, a ~1000× request amplification over
+`GetObjectTagging` call **per object**, a \~1000× request amplification over
 listing. With `-tags`, a pool of tag-fetch workers (`tag_workers`, default
 256; override with `-tag-workers`) sits between the listers and the Parquet
 writers, and the scan runs at tag-fetch speed rather than listing speed.
 Expect roughly `tag_workers ÷ per-request latency` objects/sec, and on AWS a
-per-request cost (~$0.40 per million objects). Scoping with `prefix` limits
+per-request cost (\~$0.40 per million objects). Scoping with `prefix` limits
 the cost to the subtree you care about.
 
 The output gains two columns: `tags`, a native Parquet map, and `tag_count`,
@@ -243,10 +243,10 @@ exact: `count(*) == count(DISTINCT key) ==` the number of objects populated.
 | 2,000,000,000 | 1h20m33s | 413,799 | 733,128 | 17.0 GiB |
 
 Throughput rises with scale — a larger keyspace gives the work-stealing
-scheduler more parallelism to exploit — and the output stays ~9 bytes per
+scheduler more parallelism to exploit — and the output stays \~9 bytes per
 object. With `-tags`, the same client collected 100M objects *plus all
 200M of their tags* in 1h32m (tag-fetch bound at one `GetObjectTagging`
-per object; the tags cost ~2.3 extra bytes per object on disk).
+per object; the tags cost \~2.3 extra bytes per object on disk).
 Methodology, tuning, and full reproduction steps:
 [bench-readme.md](bench-readme.md).
 

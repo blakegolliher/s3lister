@@ -167,10 +167,10 @@ since that — not the listing engine — is what a `-tags` scan measures.
 Run from the same single 8-core client VM as the listing tiers, zero tag
 errors and zero retries (`tag_retries=0` throughout — the storage system
 never throttled). The bottleneck was the client's CPU (load average 8.0 on
-8 cores building/signing/parsing ~18k requests/s), so treat this as a
+8 cores building/signing/parsing \~18k requests/s), so treat this as a
 per-client figure, not the cluster's ceiling: a larger client, or several
 clients scanning disjoint `prefix` subtrees, should scale it. Tags added
-~220 MiB over the untagged 100M output — about 2.3 bytes per object for
+\~220 MiB over the untagged 100M output — about 2.3 bytes per object for
 200M tags, thanks to the map column's dictionary encoding.
 
 ## Repairing a populate that finished with errors
@@ -224,7 +224,7 @@ result.
   VIPs migrating between nodes (failover or rebalance) reset every
   established connection at once. Check the storage system's event log at
   the error timestamp. The populator retries each key with backoff for
-  ~12s, which absorbs a normal failover; if keys still fail after retries
+  \~12s, which absorbs a normal failover; if keys still fail after retries
   it aborts at 1,000 failed keys and prints a `-start` resume point that is
   guaranteed to re-cover every failed key (chunks containing a failure
   never leave the resume window).
@@ -307,11 +307,11 @@ S3 endpoint, connections spread across all VIPs via DNS discovery:
 
 Exactness is `count(*) == count(DISTINCT key) == objects populated`, checked
 with DuckDB directly against the Parquet output. The check itself shows off
-the format: the 100M-row distinct count completes in ~7 seconds on the
+the format: the 100M-row distinct count completes in \~7 seconds on the
 client VM, no import step, from 880 MiB of Parquet.
 
 The 5M and 100M tiers ran at the default 32 readers. The 2B tier used
-`-readers 64`: at 32 the same scan held ~256k objs/s with `queued=0` the
+`-readers 64`: at 32 the same scan held \~256k objs/s with `queued=0` the
 whole way — writers idle, the listing side was the ceiling — so doubling
 readers moved the number. Expect run-to-run variance from the storage
 system's metadata cache state: earlier 2B passes over a colder cache
