@@ -215,9 +215,14 @@ func runScan(args []string) {
 				listed := readerPool.Listed()
 				written := writerPool.Written()
 				elapsed := time.Since(totalStart)
-				logger.Printf("[progress] listed=%d written=%d queued=%d rate=%.0f/s elapsed=%v",
+				tagStats := ""
+				if taggerPool != nil {
+					tagStats = fmt.Sprintf(" tagged=%d tag_errors=%d tag_retries=%d",
+						taggerPool.Tagged(), taggerPool.TagErrors(), taggerPool.Retries())
+				}
+				logger.Printf("[progress] listed=%d written=%d queued=%d rate=%.0f/s elapsed=%v%s",
 					listed, written, listed-written, float64(written)/elapsed.Seconds(),
-					elapsed.Round(time.Millisecond))
+					elapsed.Round(time.Millisecond), tagStats)
 			}
 		}
 	}()
@@ -252,8 +257,8 @@ func runScan(args []string) {
 	logger.Printf("stats: scan_id=%s objects=%d write_errors=%d list_errors=%d elapsed=%v avg_rate=%.0f/s peak_rate=%.0f/s",
 		scanID, totalObjects, writeErrors, listErrors, totalElapsed, avgRate, peakRate)
 	if taggerPool != nil {
-		logger.Printf("stats: tagged=%d tag_errors=%d tag_workers=%d",
-			taggerPool.Tagged(), tagErrors, cfg.Workers.TagWorkers)
+		logger.Printf("stats: tagged=%d tag_errors=%d tag_retries=%d tag_workers=%d",
+			taggerPool.Tagged(), tagErrors, taggerPool.Retries(), cfg.Workers.TagWorkers)
 	}
 	logger.Printf("stats: readers=%d writers=%d output_files=%d output_bytes=%d (%s) bytes_per_object=%.1f",
 		cfg.Workers.Readers, cfg.Workers.Writers, outFiles, outBytes, humanBytes(outBytes),

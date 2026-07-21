@@ -88,6 +88,55 @@ func TestTaggerRetriesTransientFailures(t *testing.T) {
 	}
 }
 
+func TestTaggerInterruptIsNotCountedAsFailure(t *testing.T) {
+	in := make(chan []model.ObjectRecord, 1)
+	out := make(chan []model.ObjectRecord, 1)
+	tp := newTestTagger(in, out, func(ctx context.Context, key string) (map[string]string, error) {
+		return nil, ctx.Err()
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // scan already shutting down when the batch is processed
+
+	in <- []model.ObjectRecord{{Key: "a"}, {Key: "b"}, {Key: "c"}}
+	close(in)
+	go tp.Run(ctx)
+	got := drain(out)
+
+	if len(got) != 3 {
+		t.Fatalf("shutdown must still forward the batch, got %d records", len(got))
+	}
+	if tp.TagErrors() != 0 {
+		t.Errorf("canceled fetches counted as tag errors: %d", tp.TagErrors())
+	}
+	for k, r := range got {
+		if r.Tags != nil {
+			t.Errorf("record %q should be forwarded untagged, got %v", k, r.Tags)
+		}
+	}
+}
+
+func TestTaggerCountsRetries(t *testing.T) {
+	var calls atomic.Int64
+	in := make(chan []model.ObjectRecord, 1)
+	out := make(chan []model.ObjectRecord, 1)
+	tp := newTestTagger(in, out, func(_ context.Context, key string) (map[string]string, error) {
+		if calls.Add(1) <= 2 {
+			return nil, errors.New("503 SlowDown")
+		}
+		return map[string]string{}, nil
+	})
+
+	in <- []model.ObjectRecord{{Key: "throttled"}}
+	close(in)
+	go tp.Run(context.Background())
+	drain(out)
+
+	if tp.Retries() != 2 {
+		t.Errorf("retries = %d, want 2", tp.Retries())
+	}
+}
+
 func TestTaggerNullTagsOnPermanentFailure(t *testing.T) {
 	in := make(chan []model.ObjectRecord, 1)
 	out := make(chan []model.ObjectRecord, 1)

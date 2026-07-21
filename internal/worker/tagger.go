@@ -41,6 +41,7 @@ type TaggerPool struct {
 
 	tagged    atomic.Int64
 	tagErrors atomic.Int64
+	retries   atomic.Int64
 }
 
 func NewTaggerPool(client *s3.Client, bucket string, workers int, in <-chan []model.ObjectRecord, out chan<- []model.ObjectRecord, logger *log.Logger) *TaggerPool {
@@ -66,6 +67,11 @@ func (tp *TaggerPool) Tagged() int64 { return tp.tagged.Load() }
 // retries. Those rows carry NULL tags (tag_count = -1) in the output.
 func (tp *TaggerPool) TagErrors() int64 { return tp.tagErrors.Load() }
 
+// Retries returns the total number of retry attempts across all fetches — the
+// live signal that the endpoint is throttling or erroring under tag load even
+// when every fetch eventually succeeds.
+func (tp *TaggerPool) Retries() int64 { return tp.retries.Load() }
+
 // Run blocks until the input channel closes and every batch has been
 // forwarded, then closes the output channel to release the writers.
 func (tp *TaggerPool) Run(ctx context.Context) {
@@ -90,8 +96,17 @@ func (tp *TaggerPool) Run(ctx context.Context) {
 func (tp *TaggerPool) worker(ctx context.Context) {
 	for batch := range tp.in {
 		for i := range batch {
+			// On shutdown, keep draining and forwarding so the pipeline
+			// unwinds, but don't count or log the canceled fetches — an
+			// interrupt is not a million tag failures.
+			if ctx.Err() != nil {
+				continue
+			}
 			tags, err := tp.fetchWithRetry(ctx, batch[i].Key)
 			if err != nil {
+				if ctx.Err() != nil {
+					continue
+				}
 				tp.tagErrors.Add(1)
 				tp.logger.Printf("[tagger] TAG FAILED key=%s: %v (row will have NULL tags)", batch[i].Key, err)
 				continue
@@ -110,6 +125,7 @@ func (tp *TaggerPool) fetchWithRetry(ctx context.Context, key string) (map[strin
 	var err error
 	for attempt := 0; attempt < tp.attempts; attempt++ {
 		if attempt > 0 {
+			tp.retries.Add(1)
 			jitter := time.Duration(rand.Int63n(int64(backoff)))
 			select {
 			case <-ctx.Done():
