@@ -16,6 +16,13 @@ import (
 
 var spinnerFrames = []rune{'⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'}
 
+// minRateWindow is the shortest interval over which an instantaneous rate is
+// computed. The render ticker can deliver two frames nearly back-to-back when
+// the process is CPU-starved (a delayed tick fires immediately before the next
+// one); dividing the large object delta accumulated during the stall by a
+// few-millisecond dt produces absurd spikes that would corrupt the peak rate.
+const minRateWindow = time.Second
+
 // Meter draws the bar and accumulates rate statistics. It is intended to be
 // driven from a single goroutine on a ticker.
 type Meter struct {
@@ -55,21 +62,7 @@ func (m *Meter) Render(listed, written int64) {
 	now := time.Now()
 	elapsed := now.Sub(m.start)
 
-	// Instantaneous write rate since the last frame, smoothed with an EMA so
-	// the displayed number does not jitter between frames.
-	if dt := now.Sub(m.lastTime).Seconds(); dt > 0 {
-		inst := float64(written-m.lastN) / dt
-		if m.emaRate == 0 {
-			m.emaRate = inst
-		} else {
-			m.emaRate = 0.7*m.emaRate + 0.3*inst
-		}
-		if m.emaRate > m.peakRate {
-			m.peakRate = m.emaRate
-		}
-	}
-	m.lastN = written
-	m.lastTime = now
+	m.sample(now, written)
 
 	// Queue depth (listed but not yet written) is a diagnostic, not a
 	// progress signal — it stays out of the live bar and is reported in the
@@ -102,6 +95,28 @@ func (m *Meter) Render(listed, written int64) {
 		humanInt(written),
 		humanInt(int64(m.emaRate)),
 		elapsed.Round(time.Second))
+}
+
+// sample folds the current written total into the smoothed rate and peak.
+// Frames arriving sooner than minRateWindow after the last accepted sample are
+// skipped — their delta simply accumulates into the next qualifying window —
+// so the rate is never computed over a tiny dt.
+func (m *Meter) sample(now time.Time, written int64) {
+	dt := now.Sub(m.lastTime)
+	if dt < minRateWindow {
+		return
+	}
+	inst := float64(written-m.lastN) / dt.Seconds()
+	if m.emaRate == 0 {
+		m.emaRate = inst
+	} else {
+		m.emaRate = 0.7*m.emaRate + 0.3*inst
+	}
+	if m.emaRate > m.peakRate {
+		m.peakRate = m.emaRate
+	}
+	m.lastN = written
+	m.lastTime = now
 }
 
 // Clear erases the current bar line (call before printing the final summary).
