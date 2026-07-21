@@ -20,6 +20,12 @@ Establish real, reproducible performance numbers now that output is Parquet.
         too short for extra readers to matter.
 - [ ] Sweep `writers` (e.g. 4/8/16) — never varied; all runs used 8 with
       writers mostly idle, so this only matters on beefier clients.
+- [ ] Find the cluster's true tag-read ceiling: the 100M `-tags` run
+      (18k tags/s, tag_retries=0) was client-CPU-bound on the 8-core VM.
+      Needs a bigger client, or two clients scanning disjoint prefixes.
+      Note: 1024 tag workers on the 8-core VM collapsed throughput
+      (~1k/s) — likely scheduler/GC thrash, worth confirming with the
+      tag_retries counter before blaming the storage side.
 - [ ] Compare on-disk size vs. the old Pebble output and vs. plain CSV/gzip.
 - [ ] Measure `export-csv` throughput (records/sec) over the Parquet parts.
 - [ ] Sample DuckDB query latencies over the output (overview, by-extension,

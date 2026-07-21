@@ -158,6 +158,21 @@ A tags result only counts if all four checks land on the exact numbers.
 Record the wall time and objects/sec alongside a note of `tag_workers`,
 since that — not the listing engine — is what a `-tags` scan measures.
 
+### Tags result
+
+| Bucket | Objects | Wall time | Avg tags/s | Peak | Tag workers | Output | Exactness |
+|--------|---------|-----------|------------|------|-------------|--------|-----------|
+| bench-100m-tags | 100,000,000 | 1h32m20s | 18,051 | 37,270 | 256 | 1.1 GiB | ✓ all four checks exact |
+
+Run from the same single 8-core client VM as the listing tiers, zero tag
+errors and zero retries (`tag_retries=0` throughout — the storage system
+never throttled). The bottleneck was the client's CPU (load average 8.0 on
+8 cores building/signing/parsing ~18k requests/s), so treat this as a
+per-client figure, not the cluster's ceiling: a larger client, or several
+clients scanning disjoint `prefix` subtrees, should scale it. Tags added
+~220 MiB over the untagged 100M output — about 2.3 bytes per object for
+200M tags, thanks to the map column's dictionary encoding.
+
 ## Repairing a populate that finished with errors
 
 If a run ends with `N errors`, that many keys are missing from the bucket
