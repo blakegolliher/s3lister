@@ -45,21 +45,27 @@ predicate/statistics pushdown instead of per-row string parsing.
 
 ## Object Tags
 
-Requires a scan run with `-tags`. `tags` is a native Parquet map: `tags['x']`
-returns the value, or NULL when the tag is absent (so it doubles as an
-existence test). `tag_count` distinguishes "no tags" (`0`) from "tags were
-not collected for this row" (`-1`).
+Requires a scan run with `-tags`. `tags` is a native Parquet map, and
+`tag_count` distinguishes "no tags" (`0`) from "tags were not collected for
+this row" (`-1`).
+
+The queries below use `map_extract`/`map_keys`, which behave the same on
+every DuckDB version. On recent DuckDB (where `tags['x']` returns the value
+directly) you can write the terser `tags['env'] = 'prod'` and
+`tags['foo'] IS NOT NULL` instead; on older versions map indexing returns a
+one-element list, which makes the terse forms error — or worse, silently
+match wrong — so prefer the portable forms for anything shared.
 
 ```sql
 -- Objects with a tag named 'foo', under one prefix
 SELECT key, size_bytes
 FROM objects
-WHERE key LIKE 'foofiles/%' AND tags['foo'] IS NOT NULL;
+WHERE key LIKE 'foofiles/%' AND list_contains(map_keys(tags), 'foo');
 
 -- Objects tagged env=prod
 SELECT key, size_bytes
 FROM objects
-WHERE tags['env'] = 'prod';
+WHERE map_extract(tags, 'env') = ['prod'];
 
 -- Explode tags into (key, tag, value) rows
 SELECT key, unnest(map_entries(tags)) AS tag

@@ -17,7 +17,8 @@ billions of objects.
 - **Analytics-ready schema**: precomputed `object_name`, `extension`,
   `parent_prefix`, and `depth` columns give predicate pushdown for free.
 - **Object tags (opt-in)**: `scan -tags` fetches every object's tags into a
-  queryable `tags` map column — `WHERE tags['env'] = 'prod'` in DuckDB.
+  queryable `tags` map column — `WHERE map_extract(tags, 'env') = ['prod']`
+  in DuckDB.
 - **Work-stealing parallelism**: idle readers steal work; huge flat prefixes are
   range-split so no single worker becomes a straggler.
 - **Live progress bar** with throughput and elapsed time; queue depth and
@@ -128,8 +129,13 @@ logged per key, and make the scan exit non-zero), `0` object has no tags,
 
 ```sql
 SELECT key, size_bytes FROM 'out/*.parquet'
-WHERE key LIKE 'foofiles/%' AND tags['foo'] IS NOT NULL;
+WHERE key LIKE 'foofiles/%' AND list_contains(map_keys(tags), 'foo');
 ```
+
+(That form works on every DuckDB version. Recent DuckDB also accepts the
+terser `tags['foo'] IS NOT NULL` / `tags['env'] = 'prod'`, but on older
+versions map indexing returns a list instead of the value — see
+[docs/QUERY_DUCKDB.md](docs/QUERY_DUCKDB.md) for the full tag query set.)
 
 ### `export-csv`
 

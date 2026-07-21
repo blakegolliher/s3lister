@@ -149,7 +149,8 @@ duckdb -c "
 # each of the 8 keys on exactly 25,000,000 objects
 
 duckdb -c "
-  SELECT count(*) FROM './out-100m-tags/*.parquet' WHERE tags['env'] = 'prod'"
+  SELECT count(*) FROM './out-100m-tags/*.parquet'
+  WHERE map_extract(tags, 'env') = ['prod']"
 # exactly 6,250,000  (every key=value pair hits the same number)
 ```
 
