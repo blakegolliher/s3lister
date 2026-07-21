@@ -92,6 +92,71 @@ object listed exactly once, no duplicates, no gaps. (No duckdb on the box?
 Same three commands per tier — populate, scan, verify — for `bench-100m` and
 `bench-2b`.
 
+## Benchmarking tag collection (`-tags`)
+
+s3lister's tag collection (`scan -tags`) is opt-in and runs at
+one-`GetObjectTagging`-call-per-object speed, so it gets its own benchmark
+tier. We target **100M objects** for tag tests: large enough to be honest
+about sustained tag-fetch throughput, small enough that a run completes in
+well under an hour.
+
+### Populate a tagged bucket
+
+```bash
+./s3lister-bench -bucket bench-100m-tags -count 100000000 -workers 512 -tags
+```
+
+`-tags` attaches tags at PUT time (they ride along in the same request, so
+populate speed is unchanged). Like the key layout, the tag layout is a pure
+function of the object index, which makes every distribution exact and
+verifiable in advance:
+
+- object `i` carries `i % 5` tags — 0 to 4, mean exactly 2
+- tag keys rotate through an 8-key pool (`env`, `team`, `project`, `tier`,
+  `owner`, `app`, `cost-center`, `retention`), each with 4 possible values
+- for any `-count` divisible by 160: exactly `count/5` objects in each
+  tag_count bucket, each key on exactly `count/4` objects, each key=value
+  pair on exactly `count/16`
+
+Resume and single-key repair work exactly as for untagged populates — just
+keep passing `-tags` (the printed resume/repair commands include it).
+
+### Scan with tags and verify
+
+```bash
+./s3lister scan -config config.toml -bucket bench-100m-tags -output ./out-100m-tags -tags
+```
+
+This is tag-fetch bound: expect roughly `tag_workers ÷ per-request latency`
+objects/sec (tune with `-tag-workers`). Then verify — every number below is
+exact for `-count 100000000`, not approximate:
+
+```bash
+duckdb -c "
+  SELECT count(*) AS rows, count(DISTINCT key) AS uniq, sum(tag_count) AS total_tags
+  FROM './out-100m-tags/*.parquet'"
+# rows = uniq = 100000000, total_tags = 200000000
+
+duckdb -c "
+  SELECT tag_count, count(*) FROM './out-100m-tags/*.parquet'
+  GROUP BY tag_count ORDER BY tag_count"
+# exactly 20,000,000 objects in each bucket 0,1,2,3,4  (and none at -1:
+# -1 anywhere means tag fetches failed — the scan will have said so loudly)
+
+duckdb -c "
+  SELECT t.key AS tag, count(*) FROM './out-100m-tags/*.parquet',
+  unnest(map_entries(tags)) AS u(t) GROUP BY tag ORDER BY tag"
+# each of the 8 keys on exactly 25,000,000 objects
+
+duckdb -c "
+  SELECT count(*) FROM './out-100m-tags/*.parquet' WHERE tags['env'] = 'prod'"
+# exactly 6,250,000  (every key=value pair hits the same number)
+```
+
+A tags result only counts if all four checks land on the exact numbers.
+Record the wall time and objects/sec alongside a note of `tag_workers`,
+since that — not the listing engine — is what a `-tags` scan measures.
+
 ## Repairing a populate that finished with errors
 
 If a run ends with `N errors`, that many keys are missing from the bucket
@@ -175,6 +240,8 @@ Options:
   -dirs2 int       Second-level directory fanout (default 64)
   -flat-pct int    Percent of keys placed in large flat prefixes (0-100, default 10)
   -flat-dirs int   Number of flat prefixes (default 16)
+  -tags            Attach a deterministic variety of tags (0-4 per object) at
+                   PUT time, for benchmarking `scan -tags`
   -log string      Log file (default "./s3lister-bench.log")
 ```
 

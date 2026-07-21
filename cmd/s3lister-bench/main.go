@@ -13,6 +13,7 @@ import (
 	"io"
 	"log"
 	"math/rand"
+	"net/url"
 	"os"
 	"os/signal"
 	"sync"
@@ -35,6 +36,59 @@ var populateExts = []string{"log", "jpg", "json", "parquet", "csv", "bin", "txt"
 // enough that the resume watermark stays tight, large enough that the atomic
 // dispatch counter is never contended.
 const populateChunk = 1000
+
+// The -tags layout, like the key layout, is a pure function of the object
+// index so every distribution is known in advance and a `scan -tags` result
+// can be verified to exact counts:
+//
+//   - object i carries i%5 tags (0-4), so a fifth of the bucket sits in each
+//     tag_count bucket and the mean is exactly 2 tags/object
+//   - tag j of object i uses key benchTagKeys[(i+j)%8], so keys vary from
+//     object to object and each key appears on exactly count/4 objects
+//   - values cycle per 40-index block: benchTagVals[k][(i/40)%4], so each
+//     key=value pair appears on exactly count/16 objects
+//
+// (The exact-count claims hold when -count is divisible by 160; the whole tag
+// set is a function of i mod 160, which also lets the encoded strings be
+// precomputed once.) See bench-readme.md for the verification queries.
+var benchTagKeys = []string{"env", "team", "project", "tier", "owner", "app", "cost-center", "retention"}
+
+var benchTagVals = [][]string{
+	{"prod", "staging", "dev", "qa"},             // env
+	{"core", "data", "infra", "ml"},              // team
+	{"apollo", "borealis", "cascade", "dune"},    // project
+	{"hot", "warm", "cold", "archive"},           // tier
+	{"alice", "bob", "carol", "dan"},             // owner
+	{"ingest", "etl", "serving", "backup"},       // app
+	{"cc-1001", "cc-1002", "cc-2001", "cc-3001"}, // cost-center
+	{"30d", "90d", "1y", "forever"},              // retention
+}
+
+// benchTagging returns the URL-encoded tag set for object index i ("" when the
+// object has none), in the form PutObject's Tagging parameter wants.
+func benchTagging(i int64) string {
+	n := i % 5
+	if n == 0 {
+		return ""
+	}
+	v := url.Values{}
+	vi := (i / 40) % 4
+	for j := int64(0); j < n; j++ {
+		k := (i + j) % 8
+		v.Set(benchTagKeys[k], benchTagVals[k][vi])
+	}
+	return v.Encode()
+}
+
+// buildTaggingTable precomputes all 160 distinct encoded tag strings so the
+// PUT hot path does a table lookup instead of URL-encoding per object.
+func buildTaggingTable() []string {
+	t := make([]string, 160)
+	for i := range t {
+		t[i] = benchTagging(int64(i))
+	}
+	return t
+}
 
 // putAttempts and putBackoffMin shape the per-key retry loop on top of the
 // SDK's own retries. The SDK's client-side retry budget drains instantly
@@ -84,6 +138,7 @@ func main() {
 	dirs2 := fs.Int64("dirs2", 64, "second-level directory fanout")
 	flatPct := fs.Int64("flat-pct", 10, "percent of objects placed in large flat prefixes (0-100)")
 	flatDirs := fs.Int64("flat-dirs", 16, "number of flat prefixes")
+	tags := fs.Bool("tags", false, "attach a deterministic variety of tags (0-4 per object) for testing scan -tags")
 	logPath := fs.String("log", "./s3lister-bench.log", "log file path")
 	failedPath := fs.String("failed-keys", "./s3lister-bench.failed", "file recording every key that failed after all retries")
 	verbose := fs.Bool("verbose", false, "verbose output: log to stderr")
@@ -110,8 +165,11 @@ func main() {
 	defer logFile.Close()
 
 	logger.Printf("=== s3lister-bench populate starting ===")
-	logger.Printf("config: bucket=%s endpoint=%s count=%d start=%d workers=%d size=%d dirs=%dx%d flat=%d%%/%d",
-		*bucket, cfg.S3.Endpoint, *count, *start, *workers, *size, *dirs1, *dirs2, *flatPct, *flatDirs)
+	logger.Printf("config: bucket=%s endpoint=%s count=%d start=%d workers=%d size=%d dirs=%dx%d flat=%d%%/%d tags=%v",
+		*bucket, cfg.S3.Endpoint, *count, *start, *workers, *size, *dirs1, *dirs2, *flatPct, *flatDirs, *tags)
+	if *tags && *count%160 != 0 {
+		logger.Printf("note: -count %d is not divisible by 160, so the per-key/per-value tag counts will be near-exact rather than exact (see bench-readme.md)", *count)
+	}
 
 	client, err := s3client.NewClient(&cfg.S3, false, logger)
 	if err != nil {
@@ -155,6 +213,9 @@ func main() {
 		failedPath: *failedPath,
 		inflight:   make(map[int64]struct{}),
 	}
+	if *tags {
+		p.tagging = buildTaggingTable()
+	}
 	defer p.closeFailedKeys()
 	p.next.Store(*start)
 
@@ -195,10 +256,14 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Resume with:  -start %d\n", resume)
 		if errCount > 0 {
 			p.closeFailedKeys()
+			tagFlag := ""
+			if *tags {
+				tagFlag = " -tags"
+			}
 			fmt.Fprintf(os.Stderr, "Failed keys recorded in:  %s\n", *failedPath)
 			fmt.Fprintf(os.Stderr, "Re-PUT just those (instead of resuming) with:\n")
-			fmt.Fprintf(os.Stderr, "  grep -o '[0-9]\\{12\\}' %s | while read i; do %s -bucket %s -count $((10#$i + 1)) -start $((10#$i)) -workers 1; done\n",
-				*failedPath, os.Args[0], *bucket)
+			fmt.Fprintf(os.Stderr, "  grep -o '[0-9]\\{12\\}' %s | while read i; do %s -bucket %s%s -count $((10#$i + 1)) -start $((10#$i)) -workers 1; done\n",
+				*failedPath, os.Args[0], *bucket, tagFlag)
 		}
 		os.Exit(1)
 	}
@@ -259,6 +324,7 @@ type populator struct {
 	d1, d2   int64
 	flatPct  int64
 	flatDirs int64
+	tagging  []string // 160 precomputed tag strings, indexed by i%160; nil = no tags
 	logger   *log.Logger
 	cancel   context.CancelFunc // stops every worker when the error cap trips
 
@@ -328,7 +394,7 @@ func (p *populator) worker(ctx context.Context) {
 				return // chunk stays in-flight → resume point stays safe
 			}
 			key := benchKey(i, p.d1, p.d2, p.flatPct, p.flatDirs)
-			if err := p.putWithRetry(ctx, key); err != nil {
+			if err := p.putWithRetry(ctx, i, key); err != nil {
 				if ctx.Err() != nil {
 					return
 				}
@@ -364,7 +430,7 @@ func (p *populator) worker(ctx context.Context) {
 // putWithRetry layers exponential jittered backoff on top of the SDK's own
 // retries, so transient events (VIP failover, node restart) are absorbed
 // instead of surfacing as failed keys.
-func (p *populator) putWithRetry(ctx context.Context, key string) error {
+func (p *populator) putWithRetry(ctx context.Context, i int64, key string) error {
 	backoff := putBackoffMin
 	var err error
 	for attempt := 0; attempt < putAttempts; attempt++ {
@@ -379,7 +445,7 @@ func (p *populator) putWithRetry(ctx context.Context, key string) error {
 				backoff *= 2
 			}
 		}
-		if err = p.put(ctx, key); err == nil {
+		if err = p.put(ctx, i, key); err == nil {
 			return nil
 		}
 		if ctx.Err() != nil {
@@ -389,13 +455,19 @@ func (p *populator) putWithRetry(ctx context.Context, key string) error {
 	return err
 }
 
-func (p *populator) put(ctx context.Context, key string) error {
-	_, err := p.client.PutObject(ctx, &s3.PutObjectInput{
+func (p *populator) put(ctx context.Context, i int64, key string) error {
+	input := &s3.PutObjectInput{
 		Bucket:        aws.String(p.bucket),
 		Key:           aws.String(key),
 		Body:          bytes.NewReader(p.body),
 		ContentLength: aws.Int64(int64(len(p.body))),
-	})
+	}
+	if p.tagging != nil {
+		if t := p.tagging[i%160]; t != "" {
+			input.Tagging = aws.String(t)
+		}
+	}
+	_, err := p.client.PutObject(ctx, input)
 	return err
 }
 

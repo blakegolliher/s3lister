@@ -101,12 +101,20 @@ file, so `-writers 8` yields `part-000.parquet` … `part-007.parquet`.
 Each run starts fresh: existing `part-*.parquet` files in the output directory
 are removed before the scan begins.
 
-#### Object tags (`-tags`)
+#### Object tags (`-tags`) — opt-in
 
-S3 does not return tags in listings — they require a separate
+**Tag collection is OFF by default.** A plain `scan` makes zero tagging
+calls and behaves exactly as it always has (every row gets `tags = NULL`,
+`tag_count = -1`). To collect tags, add `-tags`:
+
+```bash
+./s3lister scan -config config.toml -bucket my-bucket -output ./out -tags
+```
+
+Why opt-in: S3 does not return tags in listings — they require a separate
 `GetObjectTagging` call **per object**, a ~1000× request amplification over
-listing. That's why tags are opt-in: with `-tags`, a pool of tag-fetch
-workers (`tag_workers`, default 256) sits between the listers and the Parquet
+listing. With `-tags`, a pool of tag-fetch workers (`tag_workers`, default
+256; override with `-tag-workers`) sits between the listers and the Parquet
 writers, and the scan runs at tag-fetch speed rather than listing speed.
 Expect roughly `tag_workers ÷ per-request latency` objects/sec, and on AWS a
 per-request cost (~$0.40 per million objects). Scoping with `prefix` limits
