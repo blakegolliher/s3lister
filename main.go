@@ -141,10 +141,12 @@ func runScan(args []string) {
 		fatal(logger, "cannot clear old parquet parts in %s: %v", cfg.Storage.OutputDir, err)
 	}
 
-	client, err := s3client.New(&cfg.S3, *verbose, logger)
-	if err != nil {
+	// SDK client for the connectivity check; the scan's hot path uses the
+	// fast client (direct SigV4 + purpose-built XML parsing, no SDK overhead).
+	if _, err := s3client.New(&cfg.S3, *verbose, logger); err != nil {
 		fatal(logger, "%v", err)
 	}
+	client := s3client.NewFast(&cfg.S3, *verbose, logger)
 	logger.Printf("s3 connected in %v (scan_id=%s)", time.Since(totalStart), scanID)
 
 	ctx, cancel := context.WithCancel(context.Background())

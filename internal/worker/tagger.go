@@ -8,10 +8,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/service/s3"
-
 	"github.com/blake-golliher/s3lister/internal/model"
+	"github.com/blake-golliher/s3lister/internal/s3client"
 )
 
 // TaggerPool sits between the reader and writer pools when tag collection is
@@ -23,7 +21,7 @@ import (
 // its own: throughput is workers / per-request latency, independent of how
 // fast the listing side goes.
 type TaggerPool struct {
-	client  *s3.Client
+	client  *s3client.FastClient
 	bucket  string
 	workers int
 	in      <-chan []model.ObjectRecord
@@ -44,7 +42,7 @@ type TaggerPool struct {
 	retries   atomic.Int64
 }
 
-func NewTaggerPool(client *s3.Client, bucket string, workers int, in <-chan []model.ObjectRecord, out chan<- []model.ObjectRecord, logger *log.Logger) *TaggerPool {
+func NewTaggerPool(client *s3client.FastClient, bucket string, workers int, in <-chan []model.ObjectRecord, out chan<- []model.ObjectRecord, logger *log.Logger) *TaggerPool {
 	tp := &TaggerPool{
 		client:     client,
 		bucket:     bucket,
@@ -151,16 +149,5 @@ func (tp *TaggerPool) fetchWithRetry(ctx context.Context, key string) (map[strin
 // fetchFromS3 returns a non-nil map on success — even when the object has no
 // tags — so the nil map stays reserved for "not collected / fetch failed".
 func (tp *TaggerPool) fetchFromS3(ctx context.Context, key string) (map[string]string, error) {
-	out, err := tp.client.GetObjectTagging(ctx, &s3.GetObjectTaggingInput{
-		Bucket: aws.String(tp.bucket),
-		Key:    aws.String(key),
-	})
-	if err != nil {
-		return nil, err
-	}
-	tags := make(map[string]string, len(out.TagSet))
-	for _, t := range out.TagSet {
-		tags[aws.ToString(t.Key)] = aws.ToString(t.Value)
-	}
-	return tags, nil
+	return tp.client.GetTagging(ctx, tp.bucket, key)
 }

@@ -45,9 +45,10 @@ func New(cfg *config.S3Config, verbose bool, logger *log.Logger) (*s3.Client, er
 	return client, nil
 }
 
-// NewClient builds a client without any bucket existence check. Used by
-// commands that may create the bucket themselves (e.g. populate).
-func NewClient(cfg *config.S3Config, verbose bool, logger *log.Logger) (*s3.Client, error) {
+// newHTTPClient builds the tuned HTTP client shared by the SDK client and
+// the FastClient: round-robin dialing across every endpoint IP, a large idle
+// pool, and optional request tracing.
+func newHTTPClient(verbose bool, logger *log.Logger) *http.Client {
 	// Rotate new connections across every IP the endpoint resolves to, so
 	// scale-out front ends with many VIPs behind one DNS name see even load.
 	rrDialer := newRoundRobinDialer(&net.Dialer{
@@ -71,10 +72,16 @@ func NewClient(cfg *config.S3Config, verbose bool, logger *log.Logger) (*s3.Clie
 		httpTransport = &loggingTransport{inner: transport, logger: logger}
 	}
 
-	httpClient := &http.Client{
+	return &http.Client{
 		Transport: httpTransport,
 		Timeout:   120 * time.Second,
 	}
+}
+
+// NewClient builds a client without any bucket existence check. Used by
+// commands that may create the bucket themselves (e.g. populate).
+func NewClient(cfg *config.S3Config, verbose bool, logger *log.Logger) (*s3.Client, error) {
+	httpClient := newHTTPClient(verbose, logger)
 
 	creds := credentials.NewStaticCredentialsProvider(cfg.AccessKey, cfg.SecretKey, "")
 

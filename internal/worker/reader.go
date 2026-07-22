@@ -8,10 +8,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/service/s3"
-	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/blake-golliher/s3lister/internal/model"
+	"github.com/blake-golliher/s3lister/internal/s3client"
 )
 
 const (
@@ -28,6 +26,8 @@ const (
 	listAttempts   = 6
 	listBackoffMin = 200 * time.Millisecond
 	listBackoffMax = 5 * time.Second
+
+	pageSize = 1000
 )
 
 // ReaderPool fans out S3 listing with true work-stealing.
@@ -38,7 +38,7 @@ const (
 // "a bounded key range under one prefix" (range listing). No code path lists
 // the same slice twice.
 type ReaderPool struct {
-	client  *s3.Client
+	client  *s3client.FastClient
 	bucket  string
 	prefix  string
 	workers int
@@ -60,10 +60,10 @@ func (rp *ReaderPool) ListErrors() int64 {
 	return rp.listErrors.Load()
 }
 
-// nextPageWithRetry fetches the next page, retrying with exponential jittered
-// backoff. The paginator only advances its continuation token on success, so
-// retrying NextPage re-requests the same page.
-func (rp *ReaderPool) nextPageWithRetry(ctx context.Context, paginator *s3.ListObjectsV2Paginator) (*s3.ListObjectsV2Output, error) {
+// listPageWithRetry fetches one page for the query, retrying with exponential
+// jittered backoff. The query's continuation state is owned by the caller and
+// only advances on success, so a retry re-requests the same page.
+func (rp *ReaderPool) listPageWithRetry(ctx context.Context, q *s3client.ListQuery, page *s3client.ListPage) error {
 	backoff := listBackoffMin
 	var err error
 	for attempt := 0; attempt < listAttempts; attempt++ {
@@ -71,26 +71,24 @@ func (rp *ReaderPool) nextPageWithRetry(ctx context.Context, paginator *s3.ListO
 			jitter := time.Duration(rand.Int63n(int64(backoff)))
 			select {
 			case <-ctx.Done():
-				return nil, ctx.Err()
+				return ctx.Err()
 			case <-time.After(backoff + jitter):
 			}
 			if backoff < listBackoffMax {
 				backoff *= 2
 			}
 		}
-		var page *s3.ListObjectsV2Output
-		page, err = paginator.NextPage(ctx)
-		if err == nil {
-			return page, nil
+		if err = rp.client.ListPage(ctx, rp.bucket, q, page); err == nil {
+			return nil
 		}
 		if ctx.Err() != nil {
-			return nil, err
+			return err
 		}
 	}
-	return nil, err
+	return err
 }
 
-func NewReaderPool(client *s3.Client, bucket, prefix string, workers int, out chan<- []model.ObjectRecord, logger *log.Logger) *ReaderPool {
+func NewReaderPool(client *s3client.FastClient, bucket, prefix string, workers int, out chan<- []model.ObjectRecord, logger *log.Logger) *ReaderPool {
 	deques := make([]*Deque, workers)
 	for i := range deques {
 		deques[i] = NewDeque()
@@ -139,6 +137,9 @@ func (rp *ReaderPool) worker(ctx context.Context, id int) {
 	myDeque := rp.deques[id]
 	var count int64
 	rng := rand.New(rand.NewSource(time.Now().UnixNano() + int64(id)))
+	// One reusable page per worker: response-body buffer and object slices
+	// are recycled across every page this worker fetches.
+	page := &s3client.ListPage{}
 
 	defer func() {
 		rp.logger.Printf("[reader-%d] done: %d objects in %v", id, count, time.Since(workerStart))
@@ -155,7 +156,7 @@ func (rp *ReaderPool) worker(ctx context.Context, id int) {
 			// are pushed while processing, so peers may not conclude the scan
 			// is drained until this item is fully handled.
 			rp.working.Add(1)
-			count += rp.processItem(ctx, id, myDeque, item)
+			count += rp.processItem(ctx, id, myDeque, item, page)
 			rp.working.Add(-1)
 			continue
 		}
@@ -225,12 +226,12 @@ func (rp *ReaderPool) allDequesEmpty() bool {
 	return true
 }
 
-func (rp *ReaderPool) processItem(ctx context.Context, id int, myDeque *Deque, item WorkItem) int64 {
+func (rp *ReaderPool) processItem(ctx context.Context, id int, myDeque *Deque, item WorkItem, page *s3client.ListPage) int64 {
 	// Range-bounded work items are bounded flat listings.
 	if item.StartAfter != "" || item.EndAt != "" {
-		return rp.listRange(ctx, id, item)
+		return rp.listRange(ctx, id, item, page)
 	}
-	return rp.listLevel(ctx, id, myDeque, item)
+	return rp.listLevel(ctx, id, myDeque, item, page)
 }
 
 // listLevel lists one prefix level with a delimiter: objects directly at this
@@ -238,31 +239,27 @@ func (rp *ReaderPool) processItem(ctx context.Context, id int, myDeque *Deque, i
 // work item. If the first page shows a large flat prefix — truncated with no
 // sub-prefixes — the remainder is carved into range chunks that idle workers
 // steal, instead of one worker paginating it alone.
-func (rp *ReaderPool) listLevel(ctx context.Context, id int, myDeque *Deque, item WorkItem) int64 {
+func (rp *ReaderPool) listLevel(ctx context.Context, id int, myDeque *Deque, item WorkItem, page *s3client.ListPage) int64 {
 	start := time.Now()
 	var count int64
 
-	input := &s3.ListObjectsV2Input{
-		Bucket:  aws.String(rp.bucket),
-		Prefix:  aws.String(item.Prefix),
-		MaxKeys: aws.Int32(1000),
+	q := s3client.ListQuery{
+		Prefix:  item.Prefix,
+		MaxKeys: pageSize,
 	}
 	// Beyond the split-depth limit, list the whole subtree flat rather than
 	// recursing further; the flat path below still range-splits if it's huge.
-	useDelimiter := item.Depth < maxSplitDepth
-	if useDelimiter {
-		input.Delimiter = aws.String(delimiter)
+	if item.Depth < maxSplitDepth {
+		q.Delimiter = delimiter
 	}
 
 	var prefixes []string
 	firstPage := true
-	paginator := s3.NewListObjectsV2Paginator(rp.client, input)
-	for paginator.HasMorePages() {
+	for {
 		if ctx.Err() != nil {
 			return count
 		}
-		page, err := rp.nextPageWithRetry(ctx, paginator)
-		if err != nil {
+		if err := rp.listPageWithRetry(ctx, &q, page); err != nil {
 			if ctx.Err() == nil {
 				rp.listErrors.Add(1)
 				rp.logger.Printf("[reader-%d] ABANDONED prefix=%q after %d attempts (scan incomplete): %v",
@@ -271,21 +268,17 @@ func (rp *ReaderPool) listLevel(ctx context.Context, id int, myDeque *Deque, ite
 			return count
 		}
 
-		recs := toRecords(page.Contents)
+		recs := toRecords(page.Objects)
 		rp.emitBatch(recs)
 		count += int64(len(recs))
 
-		for _, cp := range page.CommonPrefixes {
-			if cp.Prefix != nil {
-				prefixes = append(prefixes, *cp.Prefix)
-			}
-		}
+		prefixes = append(prefixes, page.CommonPrefixes...)
 
 		// Large flat prefix: no sub-prefixes on a full first page. Carve the
 		// tail into disjoint (StartAfter, EndAt] chunks and stop; the
 		// chunks cover everything after this page exactly once.
-		if firstPage && len(prefixes) == 0 && aws.ToBool(page.IsTruncated) && len(page.Contents) > 0 {
-			lastKey := aws.ToString(page.Contents[len(page.Contents)-1].Key)
+		if firstPage && len(prefixes) == 0 && page.IsTruncated && len(page.Objects) > 0 {
+			lastKey := page.Objects[len(page.Objects)-1].Key
 			if rangeItems := rp.buildRangeItems(ctx, item.Prefix, lastKey); len(rangeItems) > 1 {
 				myDeque.PushBatch(rangeItems)
 				rp.logger.Printf("[reader-%d] range-split %q into %d chunks after %q",
@@ -296,6 +289,11 @@ func (rp *ReaderPool) listLevel(ctx context.Context, id int, myDeque *Deque, ite
 			// paginating sequentially.
 		}
 		firstPage = false
+
+		if !page.IsTruncated {
+			break
+		}
+		q.ContinuationToken = page.NextToken
 	}
 
 	if len(prefixes) > 0 {
@@ -343,34 +341,29 @@ func (rp *ReaderPool) buildRangeItems(ctx context.Context, prefix, startAfter st
 // evenly-spaced keys to use as range boundaries. The sampled pages are only
 // read for their key names; the range workers do the actual emission.
 func (rp *ReaderPool) sampleRangeMarkers(ctx context.Context, prefix, startAfter string, n int) []string {
-	input := &s3.ListObjectsV2Input{
-		Bucket:  aws.String(rp.bucket),
-		Prefix:  aws.String(prefix),
-		MaxKeys: aws.Int32(1000),
+	q := s3client.ListQuery{
+		Prefix:     prefix,
+		StartAfter: startAfter,
+		MaxKeys:    pageSize,
 	}
-	if startAfter != "" {
-		input.StartAfter = aws.String(startAfter)
-	}
+	// Sampling runs while the caller's page still holds live data, so it
+	// gets its own scratch page. It's a rare path — one per range split.
+	page := &s3client.ListPage{}
 
 	var allKeys []string
-	pages := 0
-	paginator := s3.NewListObjectsV2Paginator(rp.client, input)
-	for paginator.HasMorePages() && pages < 10 {
+	for pages := 0; pages < 10; pages++ {
 		// A sampling failure is not a data-loss path — the caller falls back
 		// to sequential pagination — so no listErrors here.
-		page, err := rp.nextPageWithRetry(ctx, paginator)
-		if err != nil {
+		if err := rp.listPageWithRetry(ctx, &q, page); err != nil {
 			return nil
 		}
-		for i := range page.Contents {
-			if page.Contents[i].Key != nil {
-				allKeys = append(allKeys, *page.Contents[i].Key)
-			}
+		for i := range page.Objects {
+			allKeys = append(allKeys, page.Objects[i].Key)
 		}
-		pages++
-		if !aws.ToBool(page.IsTruncated) {
+		if !page.IsTruncated {
 			break
 		}
+		q.ContinuationToken = page.NextToken
 	}
 
 	if len(allKeys) < n*2 {
@@ -394,27 +387,21 @@ func (rp *ReaderPool) sampleRangeMarkers(ctx context.Context, prefix, startAfter
 // Lists keys strictly after StartAfter, up to and including EndAt. Emitting
 // the boundary key here (and starting the next chunk strictly after it via
 // StartAfter) is what makes adjacent chunks partition the keyspace exactly.
-func (rp *ReaderPool) listRange(ctx context.Context, id int, item WorkItem) int64 {
+func (rp *ReaderPool) listRange(ctx context.Context, id int, item WorkItem, page *s3client.ListPage) int64 {
 	start := time.Now()
 	var count int64
 
-	input := &s3.ListObjectsV2Input{
-		Bucket:  aws.String(rp.bucket),
-		Prefix:  aws.String(item.Prefix),
-		MaxKeys: aws.Int32(1000),
-	}
-	if item.StartAfter != "" {
-		input.StartAfter = aws.String(item.StartAfter)
+	q := s3client.ListQuery{
+		Prefix:     item.Prefix,
+		StartAfter: item.StartAfter,
+		MaxKeys:    pageSize,
 	}
 
-	paginator := s3.NewListObjectsV2Paginator(rp.client, input)
-
-	for paginator.HasMorePages() {
+	for {
 		if ctx.Err() != nil {
 			return count
 		}
-		page, err := rp.nextPageWithRetry(ctx, paginator)
-		if err != nil {
+		if err := rp.listPageWithRetry(ctx, &q, page); err != nil {
 			if ctx.Err() == nil {
 				rp.listErrors.Add(1)
 				rp.logger.Printf("[reader-%d] ABANDONED range prefix=%q after=%q after %d attempts (scan incomplete): %v",
@@ -422,16 +409,13 @@ func (rp *ReaderPool) listRange(ctx context.Context, id int, item WorkItem) int6
 			}
 			return count
 		}
-		recs := make([]model.ObjectRecord, 0, len(page.Contents))
-		for i := range page.Contents {
-			key := page.Contents[i].Key
-			if key == nil {
-				continue
-			}
+		recs := make([]model.ObjectRecord, 0, len(page.Objects))
+		for i := range page.Objects {
+			key := page.Objects[i].Key
 			// Stop at the end boundary, emitting the boundary key itself.
-			if item.EndAt != "" && *key >= item.EndAt {
-				if *key == item.EndAt {
-					recs = append(recs, toRecord(&page.Contents[i]))
+			if item.EndAt != "" && key >= item.EndAt {
+				if key == item.EndAt {
+					recs = append(recs, toRecord(&page.Objects[i]))
 				}
 				rp.emitBatch(recs)
 				count += int64(len(recs))
@@ -441,10 +425,15 @@ func (rp *ReaderPool) listRange(ctx context.Context, id int, item WorkItem) int6
 				}
 				return count
 			}
-			recs = append(recs, toRecord(&page.Contents[i]))
+			recs = append(recs, toRecord(&page.Objects[i]))
 		}
 		rp.emitBatch(recs)
 		count += int64(len(recs))
+
+		if !page.IsTruncated {
+			break
+		}
+		q.ContinuationToken = page.NextToken
 	}
 
 	if elapsed := time.Since(start); count > 1000 || elapsed > 2*time.Second {
@@ -473,30 +462,24 @@ func (rp *ReaderPool) emitBatch(recs []model.ObjectRecord) {
 	rp.listed.Add(int64(len(recs)))
 }
 
-// toRecord converts a single S3 object into a record. Caller must ensure
-// obj.Key != nil.
-func toRecord(obj *s3types.Object) model.ObjectRecord {
-	rec := model.ObjectRecord{
-		Key:          *obj.Key,
-		Size:         aws.ToInt64(obj.Size),
-		ETag:         aws.ToString(obj.ETag),
-		StorageClass: string(obj.StorageClass),
+// toRecord converts a parsed listing entry into a record. The strings were
+// allocated by the parser and are shared, not copied.
+func toRecord(obj *s3client.ListedObject) model.ObjectRecord {
+	return model.ObjectRecord{
+		Key:          obj.Key,
+		Size:         obj.Size,
+		LastModified: obj.LastModified,
+		ETag:         obj.ETag,
+		StorageClass: obj.StorageClass,
 	}
-	if obj.LastModified != nil {
-		rec.LastModified = *obj.LastModified
-	}
-	return rec
 }
 
-// toRecords converts a page of S3 objects into a freshly allocated record
-// slice, skipping any objects with a nil key.
-func toRecords(objs []s3types.Object) []model.ObjectRecord {
-	recs := make([]model.ObjectRecord, 0, len(objs))
+// toRecords converts a page of listing entries into a freshly allocated
+// record slice (the records outlive the reused page).
+func toRecords(objs []s3client.ListedObject) []model.ObjectRecord {
+	recs := make([]model.ObjectRecord, len(objs))
 	for i := range objs {
-		if objs[i].Key == nil {
-			continue
-		}
-		recs = append(recs, toRecord(&objs[i]))
+		recs[i] = toRecord(&objs[i])
 	}
 	return recs
 }
