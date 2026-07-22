@@ -39,6 +39,7 @@ func main() {
 	workers := flag.Int("workers", 256, "concurrent workers")
 	seconds := flag.Int("seconds", 60, "run duration")
 	count := flag.Int64("count", 100_000_000, "object count in the bucket (tags mode key range)")
+	maxKeys := flag.Int("max-keys", 1000, "keys requested per LIST page (probe whether the endpoint honors >1000)")
 	flag.Parse()
 
 	if *bucket == "" {
@@ -59,7 +60,7 @@ func main() {
 	ctx, cancel := context.WithDeadline(context.Background(), deadline)
 	defer cancel()
 
-	var counter, done, errors atomic.Int64
+	var counter, done, errors, pages atomic.Int64
 	var wg sync.WaitGroup
 
 	unit := "objs"
@@ -74,7 +75,7 @@ func main() {
 					idx := counter.Add(1) % 4096
 					q := s3client.ListQuery{
 						Prefix:  fmt.Sprintf("data/d%03d/s%03d/", idx/64, idx%64),
-						MaxKeys: 1000,
+						MaxKeys: *maxKeys,
 					}
 					for {
 						if err := fast.ListPage(ctx, *bucket, &q, page); err != nil {
@@ -84,6 +85,7 @@ func main() {
 							break
 						}
 						done.Add(int64(len(page.Objects)))
+						pages.Add(1)
 						if !page.IsTruncated || !time.Now().Before(deadline) {
 							break
 						}
@@ -134,4 +136,8 @@ func main() {
 	secs := time.Since(start).Seconds()
 	fmt.Printf("TOTAL: %d %s in %.1fs = %.0f/s  errors=%d\n",
 		total, unit, secs, float64(total)/secs, errors.Load())
+	if p := pages.Load(); p > 0 {
+		fmt.Printf("pages: %d  avg keys/page: %.0f  (requested max-keys %d — if avg pins at 1000, the endpoint clamps)\n",
+			p, float64(total)/float64(p), *maxKeys)
+	}
 }

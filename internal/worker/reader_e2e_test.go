@@ -143,7 +143,7 @@ func TestReaderPoolExactlyOnce(t *testing.T) {
 	}, false, log.New(io.Discard, "", 0))
 
 	out := make(chan []model.ObjectRecord, len(keys)/100+16)
-	rp := NewReaderPool(fast, "bucket", "", 8, out, log.New(io.Discard, "", 0))
+	rp := NewReaderPool(fast, "bucket", "", 8, 1000, out, log.New(io.Discard, "", 0))
 
 	done := make(chan struct{})
 	seen := make(map[string]int)
@@ -203,7 +203,8 @@ func TestReaderPoolPrefixScoped(t *testing.T) {
 	}, false, log.New(io.Discard, "", 0))
 
 	out := make(chan []model.ObjectRecord, 64)
-	rp := NewReaderPool(fast, "bucket", "in/", 4, out, log.New(io.Discard, "", 0))
+	// Odd page size: exactly-once must hold regardless of page boundaries.
+	rp := NewReaderPool(fast, "bucket", "in/", 4, 97, out, log.New(io.Discard, "", 0))
 
 	done := make(chan struct{})
 	seen := make(map[string]int)

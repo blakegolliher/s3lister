@@ -26,8 +26,6 @@ const (
 	listAttempts   = 6
 	listBackoffMin = 200 * time.Millisecond
 	listBackoffMax = 5 * time.Second
-
-	pageSize = 1000
 )
 
 // ReaderPool fans out S3 listing with true work-stealing.
@@ -38,10 +36,11 @@ const (
 // "a bounded key range under one prefix" (range listing). No code path lists
 // the same slice twice.
 type ReaderPool struct {
-	client  *s3client.FastClient
-	bucket  string
-	prefix  string
-	workers int
+	client   *s3client.FastClient
+	bucket   string
+	prefix   string
+	workers  int
+	pageSize int
 	outCh   chan<- []model.ObjectRecord
 	listed  atomic.Int64
 	logger  *log.Logger
@@ -88,19 +87,23 @@ func (rp *ReaderPool) listPageWithRetry(ctx context.Context, q *s3client.ListQue
 	return err
 }
 
-func NewReaderPool(client *s3client.FastClient, bucket, prefix string, workers int, out chan<- []model.ObjectRecord, logger *log.Logger) *ReaderPool {
+func NewReaderPool(client *s3client.FastClient, bucket, prefix string, workers, pageSize int, out chan<- []model.ObjectRecord, logger *log.Logger) *ReaderPool {
 	deques := make([]*Deque, workers)
 	for i := range deques {
 		deques[i] = NewDeque()
 	}
+	if pageSize <= 0 {
+		pageSize = 1000
+	}
 	return &ReaderPool{
-		client:  client,
-		bucket:  bucket,
-		prefix:  prefix,
-		workers: workers,
-		outCh:   out,
-		logger:  logger,
-		deques:  deques,
+		client:   client,
+		bucket:   bucket,
+		prefix:   prefix,
+		workers:  workers,
+		pageSize: pageSize,
+		outCh:    out,
+		logger:   logger,
+		deques:   deques,
 	}
 }
 
@@ -245,7 +248,7 @@ func (rp *ReaderPool) listLevel(ctx context.Context, id int, myDeque *Deque, ite
 
 	q := s3client.ListQuery{
 		Prefix:  item.Prefix,
-		MaxKeys: pageSize,
+		MaxKeys: rp.pageSize,
 	}
 	// Beyond the split-depth limit, list the whole subtree flat rather than
 	// recursing further; the flat path below still range-splits if it's huge.
@@ -344,7 +347,7 @@ func (rp *ReaderPool) sampleRangeMarkers(ctx context.Context, prefix, startAfter
 	q := s3client.ListQuery{
 		Prefix:     prefix,
 		StartAfter: startAfter,
-		MaxKeys:    pageSize,
+		MaxKeys:    rp.pageSize,
 	}
 	// Sampling runs while the caller's page still holds live data, so it
 	// gets its own scratch page. It's a rare path — one per range split.
@@ -394,7 +397,7 @@ func (rp *ReaderPool) listRange(ctx context.Context, id int, item WorkItem, page
 	q := s3client.ListQuery{
 		Prefix:     item.Prefix,
 		StartAfter: item.StartAfter,
-		MaxKeys:    pageSize,
+		MaxKeys:    rp.pageSize,
 	}
 
 	for {

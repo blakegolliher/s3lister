@@ -18,6 +18,9 @@ queue_size = 100000
 # Goroutines fetching object tags when `scan -tags` is used
 # (one GetObjectTagging call per object)
 tag_workers = 256
+# Keys requested per ListObjectsV2 page. The S3 spec caps this at 1000, but
+# some endpoints honor more — worth probing; servers clamp silently if not.
+page_size = 1000
 
 [storage]
 # Directory that receives the part-NNN.parquet files.

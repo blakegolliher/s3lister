@@ -22,6 +22,10 @@ type WorkersConfig struct {
 	QueueSize int `toml:"queue_size"`
 	// TagWorkers sizes the GetObjectTagging pool used by `scan -tags`.
 	TagWorkers int `toml:"tag_workers"`
+	// PageSize is the max-keys requested per ListObjectsV2 page. The S3
+	// spec caps this at 1000, but some implementations honor more; the
+	// server clamps silently if it doesn't.
+	PageSize int `toml:"page_size"`
 }
 
 type StorageConfig struct {
@@ -79,6 +83,7 @@ func (c *Config) validate() error {
 	c.Workers.Writers = clampDefault(c.Workers.Writers, 1, 128, 8)
 	c.Workers.QueueSize = clampDefault(c.Workers.QueueSize, 1000, 10_000_000, 100_000)
 	c.Workers.TagWorkers = clampDefault(c.Workers.TagWorkers, 1, 4096, 256)
+	c.Workers.PageSize = clampDefault(c.Workers.PageSize, 1, 1_000_000, 1000)
 
 	if c.Storage.OutputDir == "" {
 		c.Storage.OutputDir = "./s3lister_out"

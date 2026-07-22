@@ -97,6 +97,7 @@ func runScan(args []string) {
 	output := fs.String("output", "", "override output directory from config")
 	tags := fs.Bool("tags", false, "also fetch every object's tags into the output (one GetObjectTagging call per object — expect the scan to run at tag-fetch speed, not listing speed)")
 	tagWorkers := fs.Int("tag-workers", 0, "override number of tag-fetch workers (with -tags)")
+	pageSize := fs.Int("page-size", 0, "override keys requested per LIST page (S3 spec caps at 1000; some endpoints honor more)")
 	verbose := fs.Bool("verbose", false, "verbose output: log to stderr and trace HTTP requests")
 	fs.Parse(args)
 
@@ -119,15 +120,18 @@ func runScan(args []string) {
 	if *tagWorkers > 0 {
 		cfg.Workers.TagWorkers = *tagWorkers
 	}
+	if *pageSize > 0 {
+		cfg.Workers.PageSize = *pageSize
+	}
 
 	logger, _, logFile := setupLogger(cfg.Logging.LogFile, *verbose)
 	defer logFile.Close()
 
 	logger.Printf("=== s3lister scan starting ===")
-	logger.Printf("config: bucket=%s prefix=%q endpoint=%s readers=%d writers=%d queue=%d output=%s tags=%v tag_workers=%d",
+	logger.Printf("config: bucket=%s prefix=%q endpoint=%s readers=%d writers=%d queue=%d page_size=%d output=%s tags=%v tag_workers=%d",
 		cfg.S3.Bucket, cfg.S3.Prefix, cfg.S3.Endpoint,
-		cfg.Workers.Readers, cfg.Workers.Writers, cfg.Workers.QueueSize, cfg.Storage.OutputDir,
-		*tags, cfg.Workers.TagWorkers)
+		cfg.Workers.Readers, cfg.Workers.Writers, cfg.Workers.QueueSize, cfg.Workers.PageSize,
+		cfg.Storage.OutputDir, *tags, cfg.Workers.TagWorkers)
 
 	totalStart := time.Now()
 	scanID := fmt.Sprintf("scan-%s", totalStart.UTC().Format("20060102T150405Z"))
@@ -197,7 +201,7 @@ func runScan(args []string) {
 		go taggerPool.Run(ctx)
 	}
 
-	readerPool := worker.NewReaderPool(client, cfg.S3.Bucket, cfg.S3.Prefix, cfg.Workers.Readers, recordCh, logger)
+	readerPool := worker.NewReaderPool(client, cfg.S3.Bucket, cfg.S3.Prefix, cfg.Workers.Readers, cfg.Workers.PageSize, recordCh, logger)
 
 	// Progress: animate the bar on a fast ticker, log a status line every 5s.
 	meter := progress.New()
