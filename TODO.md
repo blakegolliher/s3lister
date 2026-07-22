@@ -26,6 +26,10 @@ Establish real, reproducible performance numbers now that output is Parquet.
       Note: 1024 tag workers on the 8-core VM collapsed throughput
       (\~1k/s) — likely scheduler/GC thrash, worth confirming with the
       tag_retries counter before blaming the storage side.
+- [ ] Retake the 2B record with the fast client on a warm cache (two
+      consecutive passes; the standing 1h20m33s record was a warm third
+      pass on the SDK client). Fast-client cold pass: 1h54m32s, verified
+      exact, client below load 2.
 - [ ] Compare on-disk size vs. the old Pebble output and vs. plain CSV/gzip.
 - [ ] Measure `export-csv` throughput (records/sec) over the Parquet parts.
 - [ ] Sample DuckDB query latencies over the output (overview, by-extension,

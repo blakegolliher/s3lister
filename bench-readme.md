@@ -319,8 +319,12 @@ readers *lowers* throughput (333k and 270k avg on the 100M tier) because
 the storage system's per-page LIST latency grows with listing concurrency —
 \~170ms per 1000-key page at 64 concurrent listers, \~950ms at 256 — while
 the writers idle (`queued=0` throughout). Expect run-to-run variance from
-the storage system's metadata cache state: 2B passes over a colder cache
-averaged 256–264k objs/s.
+the storage system's metadata cache state — at the 2B tier it dominates:
+the record above was set on a hot cache (third consecutive pass), while
+cold passes run 256–291k objs/s. The most recent cold pass, with the
+direct-SigV4 client, verified exact in 1h54m32s with the client below
+load 2 on 8 cores — at this scale the storage system's cache state, not
+the client, decides the wall time.
 
 ## Reporting
 
