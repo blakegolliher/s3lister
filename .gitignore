@@ -8,3 +8,5 @@ config.toml
 /s3lister-bench
 s3lister-bench.log
 s3lister-bench.failed
+/spike/rust-fastlist/target/
+/go-fastlist

@@ -1,0 +1,15 @@
+[package]
+name = "rust-fastlist"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+memchr = "2"
+hmac = "0.12"
+sha2 = "0.10"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"] }
+reqwest = { version = "0.12", default-features = false }
+
+[profile.release]
+lto = true
+codegen-units = 1
