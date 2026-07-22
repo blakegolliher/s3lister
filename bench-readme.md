@@ -304,7 +304,7 @@ S3 endpoint, connections spread across all VIPs via DNS discovery:
 
 | Bucket | Objects | Wall time | Avg objs/s | Peak objs/s | Readers | Writers | Output size | Exactness |
 |--------|---------|-----------|------------|-------------|---------|---------|-------------|-----------|
-| bench-5m | 5,000,000 | 17.7s | 282,006 | 338,312 | 32 | 8 | 43.5 MiB | ✓ 5,000,000 |
+| bench-5m | 5,000,000 | 10.6s | 470,442 | 483,125 | 64 | 8 | 43.7 MiB | ✓ 5,000,000 |
 | bench-100m | 100,000,000 | 4m24s | 378,955 | 462,299 | 64 | 8 | 878.1 MiB | ✓ 100,000,000 |
 | bench-2b | 2,000,000,000 | 1h20m33s | 413,799 | 733,128 | 64 | 8 | 17.0 GiB | ✓ 2,000,000,000 |
 
@@ -313,8 +313,8 @@ with DuckDB directly against the Parquet output. The check itself shows off
 the format: the 100M-row distinct count completes in \~7 seconds on the
 client VM, no import step, from 880 MiB of Parquet.
 
-The 5M tier ran at the default 32 readers; the 100M and 2B tiers used
-`-readers 64`, which is the knee on the test system: pushing to 128 or 256
+All tiers ran at
+`-readers 64`, the knee on the test system: pushing to 128 or 256
 readers *lowers* throughput (333k and 270k avg on the 100M tier) because
 the storage system's per-page LIST latency grows with listing concurrency —
 \~170ms per 1000-key page at 64 concurrent listers, \~950ms at 256 — while

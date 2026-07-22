@@ -238,7 +238,7 @@ exact: `count(*) == count(DISTINCT key) ==` the number of objects populated.
 
 | Objects | Wall time | Avg objs/s | Peak objs/s | Parquet on disk |
 |---------|-----------|------------|-------------|-----------------|
-| 5,000,000 | 17.7s | 282,006 | 338,312 | 43.5 MiB |
+| 5,000,000 | 10.6s | 470,442 | 483,125 | 43.7 MiB |
 | 100,000,000 | 4m24s | 378,955 | 462,299 | 878.1 MiB |
 | 2,000,000,000 | 1h20m33s | 413,799 | 733,128 | 17.0 GiB |
 
