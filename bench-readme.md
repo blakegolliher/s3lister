@@ -162,16 +162,19 @@ since that — not the listing engine — is what a `-tags` scan measures.
 
 | Bucket | Objects | Wall time | Avg tags/s | Peak | Tag workers | Output | Exactness |
 |--------|---------|-----------|------------|------|-------------|--------|-----------|
-| bench-100m-tags | 100,000,000 | 1h32m20s | 18,051 | 37,270 | 256 | 1.1 GiB | ✓ all four checks exact |
+| bench-100m-tags | 100,000,000 | 36m35s | 45,560 | 58,062 | 256 | 1.1 GiB | ✓ all four checks exact |
 
 Run from the same single 8-core client VM as the listing tiers, zero tag
 errors and zero retries (`tag_retries=0` throughout — the storage system
-never throttled). The bottleneck was the client's CPU (load average 8.0 on
-8 cores building/signing/parsing \~18k requests/s), so treat this as a
-per-client figure, not the cluster's ceiling: a larger client, or several
-clients scanning disjoint `prefix` subtrees, should scale it. Tags added
-\~220 MiB over the untagged 100M output — about 2.3 bytes per object for
-200M tags, thanks to the map column's dictionary encoding.
+never throttled). This number moved twice on the same VM and worker count:
+the original SDK-based client held 18,051 tags/s with the CPU pinned at
+load 8; `GOGC=400` recovered enough GC overhead for 23,776; and the direct
+SigV4 client with the purpose-built XML parser reached 45,560 with CPU to
+spare — at which point 256 workers are latency-bound (\~5.6ms per
+`GetObjectTagging`), so further scaling is a worker-count and client-count
+question, not a parsing one. Tags added \~220 MiB over the untagged 100M
+output — about 2.3 bytes per object for 200M tags, thanks to the map
+column's dictionary encoding.
 
 ## Repairing a populate that finished with errors
 

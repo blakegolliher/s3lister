@@ -245,7 +245,7 @@ exact: `count(*) == count(DISTINCT key) ==` the number of objects populated.
 Throughput rises with scale — a larger keyspace gives the work-stealing
 scheduler more parallelism to exploit — and the output stays \~9 bytes per
 object. With `-tags`, the same client collected 100M objects *plus all
-200M of their tags* in 1h32m (tag-fetch bound at one `GetObjectTagging`
+200M of their tags* in 36m35s (tag-fetch bound at one `GetObjectTagging`
 per object; the tags cost \~2.3 extra bytes per object on disk).
 Methodology, tuning, and full reproduction steps:
 [bench-readme.md](bench-readme.md).
