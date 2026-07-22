@@ -69,6 +69,39 @@ bench layout; `-mode tags` fetches tags for the deterministic bench keys
 (`--count` must match the bucket's populated object count). Both wrap around,
 so any `--seconds` works.
 
+## Wire results (2026-07-22)
+
+Lab client VM (8 cores) against the 6-VIP endpoint, 120s runs, errors=0
+throughout:
+
+| Workload | Go (FastClient) | Rust (tokio/reqwest) | Ratio |
+|----------|-----------------|----------------------|-------|
+| list, 64 workers | 484,180 objs/s | 495,813 objs/s | 1.02x |
+| tags, 256 workers — cold metadata | 21,493/s | — | — |
+| tags, 256 workers — warm metadata | 37,078/s | 39,237/s | 1.06x |
+
+Two findings:
+
+1. **The languages tie at every measured operating point.** Listing waits
+   \~130ms per 1000-key page and tag reads \~6–12ms per object — both sides
+   idle on the server, and the Rust list run's 0.5 load average just shows
+   how little client CPU the wire loop needs (Go's is similarly low without
+   the Parquet pipeline attached). An initial 1.83x "Rust win" on tags
+   evaporated on an A/B/A rerun: it was VAST metadata-cache warmth — the
+   first (Go) pass ran cold, the second (Rust) pass rode the path the first
+   had just warmed.
+2. **Access pattern beats language.** The real Go scanner fetches tags in
+   listing order (strong per-directory locality) and sustains 45,560/s —
+   faster than either harness's 37–39k in deliberately locality-hostile
+   index order.
+
+**Decision: no port.** With encoding/xml and the SDK middleware already
+gone, the client is IO-bound; Rust's real parse edge (1.8–2.2x, table
+above) has nothing to bite on. Revisit if a future client is CPU-saturated
+at the wire — e.g. a many-core box pushing multiple million objs/s — or
+run the 2048-worker tags pair to probe saturation if the question ever
+reopens.
+
 ## Interpreting
 
 The scan pipeline spends its CPU in three places: response parsing, request
