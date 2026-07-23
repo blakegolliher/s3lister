@@ -55,22 +55,22 @@ tar xzf s3lister_linux_amd64.tar.gz
 ./s3lister version
 ```
 
-Or build from source (Go 1.24+): `go build -o s3lister .`
+Or build from source (Go 1.24+): clone the repo and run `make`.
 
 ## Quick Start
 
 ```bash
-# Build (skip if you downloaded a release binary)
-go build -o s3lister .
+# 1. Get the binary — download a release (above), or clone and build:
+make                  # -> ./s3lister
 
-# Configure credentials
+# 2. Configure: copy the example and fill in your endpoint + credentials
 cp config.toml.example config.toml
-vi config.toml
+vi config.toml        # endpoint, access_key, secret_key, bucket
 
-# Scan a bucket -> writes ./s3lister_out/part-*.parquet
+# 3. Fire off a scan -> writes ./s3lister_out/part-*.parquet
 ./s3lister scan -config config.toml
 
-# Query it immediately with DuckDB (no import step)
+# 4. Query it immediately with DuckDB (no import step)
 duckdb -c "SELECT count(*), sum(size_bytes) FROM 's3lister_out/*.parquet'"
 ```
 

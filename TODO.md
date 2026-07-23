@@ -30,7 +30,7 @@ Establish real, reproducible performance numbers now that output is Parquet.
       consecutive passes; the standing 1h20m33s record was a warm third
       pass on the SDK client). Fast-client cold pass: 1h54m32s, verified
       exact, client below load 2.
-- [ ] Compare on-disk size vs. the old Pebble output and vs. plain CSV/gzip.
+- [ ] Compare on-disk size vs. plain CSV/gzip.
 - [ ] Measure `export-csv` throughput (records/sec) over the Parquet parts.
 - [ ] Sample DuckDB query latencies over the output (overview, by-extension,
       largest objects) to confirm the schema's pushdown pays off.

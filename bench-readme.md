@@ -17,8 +17,8 @@ measuring.
 ```bash
 git clone https://github.com/blakegolliher/s3lister.git
 cd s3lister
-go build -o s3lister .                            # the scanner being measured
-go build -o s3lister-bench ./cmd/s3lister-bench   # the bucket populator
+make          # the scanner being measured   -> ./s3lister
+make bench    # the bucket populator         -> ./s3lister-bench
 ```
 
 If `./cmd/s3lister-bench` doesn't exist, your checkout predates the bench

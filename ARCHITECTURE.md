@@ -4,12 +4,15 @@
 
 ```bash
 # Clone and build
-git clone <repo>
+git clone https://github.com/blakegolliher/s3lister.git
 cd s3lister
-go build -o s3lister .
+make            # -> ./s3lister, version-stamped from git
 
-# Or install directly
-go install .
+# Other targets
+make bench      # -> ./s3lister-bench (benchmark bucket populator)
+make test       # run the test suite
+
+# Without make: go build -o s3lister .   (or: go install .)
 ```
 
 No CGO required. All dependencies are pure Go, including the Parquet writer.
@@ -146,7 +149,7 @@ diff by run.
 
 ### Why Parquet Instead of a Key-Value Store?
 
-For a write-once bucket snapshot, an LSM key-value store (Pebble/RocksDB) pays
+For a write-once bucket snapshot, an LSM key-value store (e.g. RocksDB) pays
 for features this workload never uses: it sorts and **rewrites data repeatedly**
 during background compaction (write amplification), and its values are opaque
 blobs that still need an export step before any query engine can read them.
