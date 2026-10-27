@@ -16,7 +16,6 @@ import (
 )
 
 const (
-	maxSplitDepth   = 8 // generous depth limit for prefix splitting
 	stealBackoffMin = 500 * time.Microsecond
 	stealBackoffMax = 50 * time.Millisecond
 	delimiter       = "/"
@@ -260,15 +259,17 @@ func (rp *ReaderPool) processItem(ctx context.Context, id int, myDeque *Deque, i
 	start := time.Now()
 	var count int64
 
+	// Every level is listed with the delimiter, however deep. A flat listing
+	// would save a request per small directory, but it cannot be split once
+	// its keys all sit under one sub-prefix (split points never contain the
+	// delimiter), so one reader would page through a huge deep directory
+	// alone. And VAST silently leaves unreadable directories out of flat
+	// listings, where a delimiter listing surfaces them as DENIED.
 	q := s3client.ListQuery{
 		Prefix:     item.Prefix,
+		Delimiter:  delimiter,
 		StartAfter: item.StartAfter,
 		MaxKeys:    rp.pageSize,
-	}
-	// Beyond the split-depth limit, list the whole subtree flat rather than
-	// recursing further.
-	if item.Depth < maxSplitDepth {
-		q.Delimiter = delimiter
 	}
 	end := item.EndAt       // inclusive; "" means the end of the prefix. Shrinks on split.
 	last := item.StartAfter // the last entry listed so far
@@ -421,7 +422,12 @@ func splitPoint(lo, hi string) (string, bool) {
 	var buf []byte
 	for _, d := range ds {
 		if d == ceil {
-			break // "above the alphabet" only means end of prefix; never send it
+			// "Above the alphabet" can't be sent. Dropping it would cut
+			// below lo whenever lo continues past this digit ("d_9…" vs
+			// "e…" gives "d"), so cut at the top alphabet byte, which
+			// sorts just under it ("d~").
+			buf = append(buf, splitAlphabet[ceil-1])
+			break
 		}
 		buf = append(buf, splitAlphabet[d])
 	}

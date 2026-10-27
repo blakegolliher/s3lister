@@ -119,31 +119,80 @@ func TestSplitPointProperties(t *testing.T) {
 			t.Errorf("splitPoint(%q, %q) = %q, want no split", c.lo, c.hi, mid)
 		}
 	}
+	// Pairs with room for a cut, where the midpoint's second digit lands
+	// on "above the alphabet". splitPoint used to drop that digit and cut
+	// below lo, then give up on every later page of the range.
+	for _, c := range []struct{ lo, hi string }{
+		{"p/d_970_101/f_000999.c", "p/eQZXW9"},
+		{"p/d_", "p/eQ"},
+	} {
+		mid, ok := splitPoint(c.lo, c.hi)
+		if !ok || !(c.lo < mid && mid < c.hi) {
+			t.Errorf("splitPoint(%q, %q) = %q, %v; want a cut strictly between", c.lo, c.hi, mid, ok)
+		}
+	}
 }
 
-// TestSplitPointConverges replays the open-ended case from a real scan: a
-// reader past the first page of a 2.6M-object directory, splitting against
-// "end of prefix". Cuts that land above the last key hand off empty ranges;
-// the halving must reach the real keys within a handful of those.
+// TestSplitPointConverges replays the open-ended case from real scans: a
+// reader past the first page of a multi-million-object directory, splitting
+// against "end of prefix". Cuts that land above the last key hand off empty
+// ranges; the halving must reach the real keys within a handful of those.
 func TestSplitPointConverges(t *testing.T) {
-	const prefix = "web/d_864_7/"
-	lo := prefix + "f_000999.css"
-	maxKey := prefix + "f_999999.xml"
-	hi := prefix + "\x7f"
-	for wasted := 0; ; wasted++ {
-		if wasted > 20 {
-			t.Fatalf("still no cut inside the keys after %d empty ranges (hi=%q)", wasted, hi)
+	for _, c := range []struct{ prefix, lo, maxKey string }{
+		{"web/d_864_7/", "f_000999.css", "f_999999.xml"},
+		// Nine levels deep, 2.5M objects, names past f_999999 growing a
+		// seventh digit.
+		{"scratch/d_225_6/d_705_10/d_707_11/d_623_15/d_127_18/d_370_28/d_026_54/d_970_101/",
+			"f_000999.c", "f_999999.sh"},
+	} {
+		lo, maxKey, hi := c.prefix+c.lo, c.prefix+c.maxKey, c.prefix+"\x7f"
+		for wasted := 0; ; wasted++ {
+			if wasted > 20 {
+				t.Fatalf("%s: still no cut inside the keys after %d empty ranges (hi=%q)", c.prefix, wasted, hi)
+			}
+			mid, ok := splitPoint(lo, hi)
+			if !ok {
+				t.Fatalf("splitPoint(%q, %q) gave up", lo, hi)
+			}
+			if mid <= maxKey {
+				t.Logf("%s: cut %q after %d empty ranges", c.prefix, mid, wasted)
+				break
+			}
+			hi = mid
 		}
-		mid, ok := splitPoint(lo, hi)
-		if !ok {
-			t.Fatalf("splitPoint(%q, %q) gave up", lo, hi)
-		}
-		if mid <= maxKey {
-			t.Logf("cut %q after %d empty ranges", mid, wasted)
-			return
-		}
-		hi = mid
 	}
+}
+
+// TestReaderPoolSplitsDeepDirectory: one huge directory far below the top
+// of the tree must be shared by every free reader. Listing used to go flat
+// past depth 8, and a flat range whose keys all sit under one sub-prefix
+// cannot be cut (split points never contain the delimiter), so a single
+// reader paged through it alone while the rest sat idle.
+func TestReaderPoolSplitsDeepDirectory(t *testing.T) {
+	var keys []string
+	for i := 0; i < 30000; i++ {
+		keys = append(keys, fmt.Sprintf("s/1/2/3/4/5/6/7/8/d_970_101/f_%06d.c", i*83))
+	}
+	keys = append(keys, "s/1/2/3/4/5/6/7/8/d_111_5/f_000001.c")
+
+	var logBuf syncBuffer
+	seen, rp := runPool(t, fakeS3Handler(keys), "", 16, 100, log.New(&logBuf, "", 0))
+	checkExactlyOnce(t, seen, keys)
+
+	// Every reader logs its total on exit. Split-off ranges that land past
+	// the last key are cheap and expected, so count objects, not splits.
+	busiest := 0
+	for _, line := range strings.Split(logBuf.String(), "\n") {
+		var id, n int
+		if _, err := fmt.Sscanf(line, "[reader-%d] done: %d objects", &id, &n); err == nil && n > busiest {
+			busiest = n
+		}
+	}
+	if busiest > len(keys)/3 {
+		t.Errorf("one reader listed %d of %d objects (%d splits); the directory was not shared",
+			busiest, len(keys), rp.Splits())
+	}
+	t.Logf("busiest reader listed %d of %d objects, %d splits", busiest, len(keys), rp.Splits())
 }
 
 // TestReaderPoolSplitsExactlyOnce forces heavy splitting — tiny pages, many
@@ -167,7 +216,7 @@ func TestReaderPoolSplitsExactlyOnce(t *testing.T) {
 	keys = append(keys, "mix/f-00500", "mix/sub", "mix/sub-x", "mix/sub.txt", "mix/sub0", "mix/sub0z")
 	// A big flat directory.
 	add("flat/f00/o-%07d", 20000)
-	// Below the split-depth limit, where listing goes flat.
+	// Deep levels, where listing used to go flat.
 	add("deep/1/2/3/4/5/6/7/8/9/k-%05d", 3000)
 	add("deep/1/2/3/4/5/6/7/8/a/b/k-%03d", 300)
 	// Names outside the split alphabet: spaces, tildes, non-ASCII.

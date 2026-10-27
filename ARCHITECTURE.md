@@ -88,15 +88,18 @@ When a reader picks up a work item, it first tries to **split** the prefix into 
 ```
 
 Sub-prefixes are pushed as each page reveals them, not after the whole level
-is listed. Below depth 8 a reader stops recursing and lists the remaining
-subtree flat (no delimiter), to avoid one request per tiny directory in very
-deep trees.
+is listed. Every level is listed with the delimiter, however deep. That
+costs one request per small directory in deep trees, and it buys two things
+a flat (no-delimiter) listing of the subtree can't give:
 
-> **Caveat:** a flat listing cannot report a directory it was not allowed to
-> read. VAST, at least, silently leaves unreadable directories out of a flat
-> listing (HTTP 200, no sign of them), whereas a delimiter listing shows them
-> as common prefixes that then fail with 403. So denied directories below
-> depth 8 are not detected.
+- **Every directory can be split.** Split points never contain the
+  delimiter (see below), so a flat range whose keys all sit under one
+  sub-prefix has no place to cut. A multi-million-object directory nine
+  levels down would be paged through by one reader while the rest sat idle.
+- **Denied directories are always reported.** VAST silently leaves
+  unreadable directories out of a flat listing (HTTP 200, no sign of them),
+  whereas a delimiter listing shows them as common prefixes that then fail
+  with 403.
 
 ### Range Splitting
 
