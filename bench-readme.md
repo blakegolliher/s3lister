@@ -36,17 +36,20 @@ Leave `bucket` as any placeholder — the commands below name their buckets
 explicitly, and `s3lister-bench` creates them if they don't exist.
 
 **Use the DNS name of the endpoint, not a single VIP.** Both binaries
-resolve the hostname and rotate new connections across every IP it returns
-(re-resolving every 30s), so a scale-out front end with many VIPs behind one
-name gets even load. On startup the log records what was discovered:
+discover every IP behind the hostname and rotate new connections across
+them (rediscovering every 30s), so a scale-out front end with many VIPs
+behind one name gets even load. Discovery samples the system resolver and
+then the name's authoritative nameserver directly, because load-balancing
+DNS answers one rotating VIP per query and caching resolvers in between
+(systemd-resolved, site DNS) repeat whichever one they saw first. On
+startup the log records what was discovered and from where:
 
 ```
-[s3] endpoint main.selab... resolves to 16 address(es): 172.200.204.1, ...
+[s3] endpoint main.selab... resolves to 6 address(es): 172.200.204.1, ... (system resolver: 1 in 9 queries; nameserver 10.143.11.224:53: 6 in 30 queries)
 ```
 
 Check that count matches the number of VIPs you expect the cluster to
-publish — if it says 1, your DNS name only returns one address and every
-connection lands on the same node.
+publish — if it says 1, every connection lands on the same node.
 
 ### 3. Populate a benchmark bucket
 
@@ -231,15 +234,18 @@ result.
   it aborts at 1,000 failed keys and prints a `-start` resume point that is
   guaranteed to re-cover every failed key (chunks containing a failure
   never leave the resume window).
-- **All load lands on one node** — check what DNS actually returns:
-  `dig +short <endpoint>` a few times in a row.
-  - *Same single IP every query*: the name is a static record pointing at one
-    VIP. No client can spread that — publish all VIPs under the name, or use
-    the storage system's delegated/load-balancing DNS name.
-  - *Different single IP each query*: server-side round-robin. The client
-    re-resolves on every new connection in this mode (it logs
-    `single-address DNS answer: re-resolving on every connection`), so
-    connections follow the server's rotation.
+- **All load lands on one node** — the startup log says
+  `only one address found`. Check what DNS returns at each layer:
+  `dig +short <endpoint>` a few times in a row, then find the zone's
+  nameserver (`dig +short NS <parent domain>`) and repeat with
+  `dig +short @<nameserver> <endpoint>`.
+  - *Same IP from your resolver, rotating IPs from the nameserver*: a caching
+    resolver is pinning one answer. The client works around this by querying
+    the nameserver itself; if the log says `nameserver ...: no answer`, this
+    host can't reach it on port 53, so open that path.
+  - *Same single IP from the nameserver too*: the name is a static record
+    pointing at one VIP. No client can spread that — publish all VIPs under
+    the name, or use the storage system's delegated/load-balancing DNS name.
   - *Many IPs per query*: the client rotates across all of them itself; the
     startup log lists what it found.
 

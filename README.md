@@ -272,9 +272,13 @@ Methodology, tuning, and full reproduction steps:
   more readers means more in-flight `ListObjectsV2` requests. 32–128 is typical;
   the work-stealing scheduler keeps them all busy.
 - **Point the endpoint at a DNS name, not one VIP.** New connections are
-  rotated across every IP the name resolves to (re-resolved every 30s), so
-  scale-out front ends see even load across all their nodes. The log shows
-  the discovered addresses at startup.
+  rotated across every IP the name resolves to, so scale-out front ends see
+  even load across all their nodes. Load-balancing DNS (like VAST's) answers
+  with one rotating VIP per query, and caching resolvers in between keep
+  handing back the same one, so s3lister also queries the name's
+  authoritative nameserver directly until its rotation stops turning up new
+  VIPs (rediscovered every 30s). The log shows the discovered addresses at
+  startup.
 - **Writers** are CPU-bound on zstd compression. Roughly one writer per core is a
   good starting point. More writers = more output part files.
 - **Large prefixes** (millions of keys under one prefix) are split on demand:
