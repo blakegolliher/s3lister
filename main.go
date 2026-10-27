@@ -203,8 +203,10 @@ func runScan(args []string) {
 
 	readerPool := worker.NewReaderPool(client, cfg.S3.Bucket, cfg.S3.Prefix, cfg.Workers.Readers, cfg.Workers.PageSize, recordCh, logger)
 
-	// Progress: animate the bar on a fast ticker, log a status line every 5s.
+	// Progress: animate the bar on a fast ticker, log a status line every 5s,
+	// each followed by the request latency and errors of those 5s.
 	meter := progress.New()
+	var listWin, tagWin s3client.StatsSnapshot
 	stopProgress := make(chan struct{})
 	go func() {
 		tick := time.NewTicker(100 * time.Millisecond)
@@ -229,6 +231,10 @@ func runScan(args []string) {
 				logger.Printf("[progress] listed=%d written=%d queued=%d rate=%.0f/s elapsed=%v%s",
 					listed, written, listed-written, float64(written)/elapsed.Seconds(),
 					elapsed.Round(time.Millisecond), tagStats)
+				logger.Printf("[s3-list] %s", client.ListStats().Window(&listWin))
+				if taggerPool != nil {
+					logger.Printf("[s3-tag] %s", client.TagStats().Window(&tagWin))
+				}
 			}
 		}
 	}()
@@ -250,6 +256,8 @@ func runScan(args []string) {
 	totalObjects := writerPool.Written()
 	writeErrors := writerPool.Errors()
 	listErrors := readerPool.ListErrors()
+	denied := readerPool.Denied()
+	listStats := client.ListStats().Snapshot()
 	avgRate := float64(totalObjects) / totalElapsed.Seconds()
 	peakRate := meter.PeakRate()
 	outBytes, outFiles := dirSize(cfg.Storage.OutputDir)
@@ -260,22 +268,32 @@ func runScan(args []string) {
 	}
 
 	logger.Printf("=== scan complete ===")
-	logger.Printf("stats: scan_id=%s objects=%d write_errors=%d list_errors=%d elapsed=%v avg_rate=%.0f/s peak_rate=%.0f/s",
-		scanID, totalObjects, writeErrors, listErrors, totalElapsed, avgRate, peakRate)
+	logger.Printf("stats: scan_id=%s objects=%d write_errors=%d list_errors=%d denied=%d elapsed=%v avg_rate=%.0f/s peak_rate=%.0f/s",
+		scanID, totalObjects, writeErrors, listErrors, denied, totalElapsed, avgRate, peakRate)
+	logger.Printf("stats: list %s range_splits=%d", listStats, readerPool.Splits())
 	if taggerPool != nil {
 		logger.Printf("stats: tagged=%d tag_errors=%d tag_retries=%d tag_workers=%d",
 			taggerPool.Tagged(), tagErrors, taggerPool.Retries(), cfg.Workers.TagWorkers)
+		logger.Printf("stats: tag %s", client.TagStats().Snapshot())
 	}
 	logger.Printf("stats: readers=%d writers=%d output_files=%d output_bytes=%d (%s) bytes_per_object=%.1f",
 		cfg.Workers.Readers, cfg.Workers.Writers, outFiles, outBytes, humanBytes(outBytes),
 		safeDiv(float64(outBytes), float64(totalObjects)))
 
-	if listErrors > 0 {
-		fmt.Fprintf(os.Stderr, "\nSCAN INCOMPLETE! %d listing failure(s) — parts of the bucket were NOT listed.\n", listErrors)
+	if listErrors > 0 || denied > 0 {
+		fmt.Fprintf(os.Stderr, "\nSCAN INCOMPLETE! Parts of the bucket were NOT listed.\n")
 		fmt.Fprintf(os.Stderr, "  %d objects written in %v, but the dataset is missing keyspace.\n",
 			totalObjects, totalElapsed.Round(time.Millisecond))
-		fmt.Fprintf(os.Stderr, "  Grep the log for ABANDONED to see which prefixes/ranges were lost,\n")
-		fmt.Fprintf(os.Stderr, "  resolve the endpoint issue, and re-run the scan.\n")
+		if denied > 0 {
+			fmt.Fprintf(os.Stderr, "  %d prefix(es) DENIED (HTTP 403): these credentials cannot list them, so a\n", denied)
+			fmt.Fprintf(os.Stderr, "    re-run won't either. Grep the log for DENIED, then grant access or\n")
+			fmt.Fprintf(os.Stderr, "    accept the gap.\n")
+		}
+		if listErrors > 0 {
+			fmt.Fprintf(os.Stderr, "  %d listing(s) ABANDONED after exhausting retries. Grep the log for\n", listErrors)
+			fmt.Fprintf(os.Stderr, "    ABANDONED, resolve the endpoint issue, and re-run the scan.\n")
+		}
+		fmt.Fprintf(os.Stderr, "  LIST %s\n", listStats)
 		fmt.Fprintf(os.Stderr, "  log: %s\n", cfg.Logging.LogFile)
 		os.Exit(1)
 	}
@@ -290,9 +308,11 @@ func runScan(args []string) {
 
 	fmt.Fprintf(os.Stderr, "\nDone! %d objects in %v\n", totalObjects, totalElapsed.Round(time.Millisecond))
 	fmt.Fprintf(os.Stderr, "  avg %.0f/s   peak %.0f/s\n", avgRate, peakRate)
+	fmt.Fprintf(os.Stderr, "  LIST %s\n", listStats)
 	fmt.Fprintf(os.Stderr, "  output: %s  (%d files, %s)\n", cfg.Storage.OutputDir, outFiles, humanBytes(outBytes))
 	if taggerPool != nil {
 		fmt.Fprintf(os.Stderr, "  tags: fetched for all %d objects\n", taggerPool.Tagged())
+		fmt.Fprintf(os.Stderr, "  TAG  %s\n", client.TagStats().Snapshot())
 	}
 	if writeErrors > 0 {
 		fmt.Fprintf(os.Stderr, "  WARNING: %d write errors occurred, check log\n", writeErrors)

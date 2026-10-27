@@ -2,6 +2,7 @@ package s3client
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -31,6 +32,9 @@ type FastClient struct {
 	creds   aws.Credentials
 	signer  *v4.Signer
 	tagBufs sync.Pool
+
+	listStats OpStats
+	tagStats  OpStats
 }
 
 // sha256 of an empty payload — every request we send has no body.
@@ -62,8 +66,14 @@ func NewFast(cfg *config.S3Config, verbose bool, logger *log.Logger) *FastClient
 	return fc
 }
 
+// ListStats is the latency and status accounting for every ListPage request.
+func (c *FastClient) ListStats() *OpStats { return &c.listStats }
+
+// TagStats is the latency and status accounting for every GetTagging request.
+func (c *FastClient) TagStats() *OpStats { return &c.tagStats }
+
 // ListPage fetches one ListObjectsV2 page into page, reusing page's buffers.
-// Retry policy belongs to the caller; every error return is retryable there.
+// Retry policy belongs to the caller; Permanent says which errors not to retry.
 func (c *FastClient) ListPage(ctx context.Context, bucket string, q *ListQuery, page *ListPage) error {
 	var sb strings.Builder
 	sb.Grow(len(c.base) + len(bucket) + len(q.Prefix)*3 + 96)
@@ -92,7 +102,7 @@ func (c *FastClient) ListPage(ctx context.Context, bucket string, q *ListQuery, 
 		writeEscaped(&sb, q.ContinuationToken, false)
 	}
 
-	body, status, err := c.do(ctx, sb.String(), page.body)
+	body, status, err := c.do(ctx, sb.String(), page.body, &c.listStats)
 	page.body = body
 	if err != nil {
 		return err
@@ -100,7 +110,11 @@ func (c *FastClient) ListPage(ctx context.Context, bucket string, q *ListQuery, 
 	if status != http.StatusOK {
 		return statusError(status, body)
 	}
-	return parseListPage(body, page)
+	if err := parseListPage(body, page); err != nil {
+		c.listStats.unparsed.Add(1)
+		return err
+	}
+	return nil
 }
 
 // GetTagging fetches an object's tags. The returned map is non-nil on
@@ -118,7 +132,7 @@ func (c *FastClient) GetTagging(ctx context.Context, bucket, key string) (map[st
 	writeEscaped(&sb, key, true)
 	sb.WriteString("?tagging=")
 
-	body, status, err := c.do(ctx, sb.String(), (*bp)[:0])
+	body, status, err := c.do(ctx, sb.String(), (*bp)[:0], &c.tagStats)
 	*bp = body
 	if err != nil {
 		return nil, err
@@ -126,11 +140,17 @@ func (c *FastClient) GetTagging(ctx context.Context, bucket, key string) (map[st
 	if status != http.StatusOK {
 		return nil, statusError(status, body)
 	}
-	return parseTagging(body)
+	tags, err := parseTagging(body)
+	if err != nil {
+		c.tagStats.unparsed.Add(1)
+	}
+	return tags, err
 }
 
-// do signs and executes a body-less GET, reading the response into buf.
-func (c *FastClient) do(ctx context.Context, url string, buf []byte) ([]byte, int, error) {
+// do signs and executes a body-less GET, reading the response into buf, and
+// records the request's latency (through the last body byte) and outcome in
+// stats. Requests cut short by cancellation are not recorded.
+func (c *FastClient) do(ctx context.Context, url string, buf []byte, stats *OpStats) ([]byte, int, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return buf, 0, err
@@ -140,17 +160,69 @@ func (c *FastClient) do(ctx context.Context, url string, buf []byte) ([]byte, in
 		return buf, 0, fmt.Errorf("sign request: %w", err)
 	}
 
+	start := time.Now()
 	resp, err := c.http.Do(req)
 	if err != nil {
+		if ctx.Err() == nil {
+			stats.record(time.Since(start), 0)
+		}
 		return buf, 0, err
 	}
 	defer resp.Body.Close()
 	buf, err = readInto(buf[:0], resp.Body)
+	if ctx.Err() == nil {
+		status := resp.StatusCode
+		if err != nil {
+			status = 0 // the response never arrived whole
+		}
+		stats.record(time.Since(start), status)
+	}
 	return buf, resp.StatusCode, err
 }
 
+// S3Error is an S3 error response. Status is 0 when the <Error> body came
+// with HTTP 200. RequestID is what the endpoint's own logs are keyed by, so
+// it travels with every failure the scan reports.
+type S3Error struct {
+	Status    int
+	Code      string
+	Message   string
+	RequestID string
+}
+
+func (e *S3Error) Error() string {
+	var sb strings.Builder
+	if e.Status != 0 {
+		fmt.Fprintf(&sb, "HTTP %d: ", e.Status)
+	}
+	if e.Code != "" {
+		fmt.Fprintf(&sb, "s3 error %s: %s", e.Code, e.Message)
+	} else {
+		sb.WriteString(e.Message)
+	}
+	if e.RequestID != "" {
+		fmt.Fprintf(&sb, " (request_id=%s)", e.RequestID)
+	}
+	return sb.String()
+}
+
+// Permanent reports whether err is a refusal that retrying cannot fix. Only
+// HTTP 403 qualifies: the endpoint understood the request and said no —
+// AccessDenied, but also bad credentials or a skewed clock, none of which
+// clear up inside a retry budget. Everything else (5xx, throttling, timeouts,
+// connection resets) is treated as transient.
+func Permanent(err error) bool {
+	var se *S3Error
+	return errors.As(err, &se) && se.Status == http.StatusForbidden
+}
+
 func statusError(status int, body []byte) error {
-	return fmt.Errorf("HTTP %d: %w", status, s3BodyError(body))
+	se := parseErrorBody(body)
+	if se == nil {
+		se = &S3Error{Message: fmt.Sprintf("unexpected response body %q", bodyHead(body))}
+	}
+	se.Status = status
+	return se
 }
 
 // readInto reads all of r into buf, growing it as needed and returning the

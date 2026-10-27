@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/blake-golliher/s3lister/internal/model"
+	"github.com/blake-golliher/s3lister/internal/s3client"
 )
 
 func newTestTagger(in chan []model.ObjectRecord, out chan []model.ObjectRecord,
@@ -163,5 +164,24 @@ func TestTaggerNullTagsOnPermanentFailure(t *testing.T) {
 	}
 	if tp.TagErrors() != 1 || tp.Tagged() != 1 {
 		t.Errorf("counters: tagged=%d errors=%d, want 1/1", tp.Tagged(), tp.TagErrors())
+	}
+}
+
+func TestTaggerDoesNotRetryDenied(t *testing.T) {
+	in := make(chan []model.ObjectRecord, 1)
+	out := make(chan []model.ObjectRecord, 1)
+	var calls atomic.Int64
+	tp := newTestTagger(in, out, func(_ context.Context, key string) (map[string]string, error) {
+		calls.Add(1)
+		return nil, &s3client.S3Error{Status: 403, Code: "AccessDenied"}
+	})
+
+	in <- []model.ObjectRecord{{Key: "k"}}
+	close(in)
+	go tp.Run(context.Background())
+	drain(out)
+
+	if calls.Load() != 1 || tp.Retries() != 0 || tp.TagErrors() != 1 {
+		t.Errorf("calls=%d retries=%d errors=%d, want 1/0/1", calls.Load(), tp.Retries(), tp.TagErrors())
 	}
 }
