@@ -441,37 +441,52 @@ func parseTagging(body []byte) (map[string]string, error) {
 	}
 }
 
-// s3BodyError extracts Code/Message from an S3 <Error> body, or reports the
-// body head verbatim when it isn't one.
+// s3BodyError extracts the fields of an S3 <Error> body, or reports the body
+// head verbatim when it isn't one.
 func s3BodyError(body []byte) error {
+	if se := parseErrorBody(body); se != nil {
+		return se
+	}
+	return fmt.Errorf("unexpected S3 response: %q", bodyHead(body))
+}
+
+// parseErrorBody returns the Code, Message and RequestId of an S3 <Error>
+// body, or nil when body isn't one.
+func parseErrorBody(body []byte) *S3Error {
 	s := xmlScan{b: body}
 	name, closing, self, ok := s.nextTag()
-	if ok && !closing && !self && bytes.Equal(name, []byte("Error")) {
-		var code, msg string
-		for {
-			n, c, self2, ok2 := s.nextTag()
-			if !ok2 || (c && bytes.Equal(n, []byte("Error"))) {
-				break
-			}
-			if c || self2 {
-				continue
-			}
-			switch {
-			case bytes.Equal(n, []byte("Code")):
-				code = unescape(s.leaf())
-			case bytes.Equal(n, []byte("Message")):
-				msg = unescape(s.leaf())
-			default:
-				s.skipElement()
-			}
+	if !ok || closing || self || !bytes.Equal(name, []byte("Error")) {
+		return nil
+	}
+	var se S3Error
+	for {
+		n, c, self2, ok2 := s.nextTag()
+		if !ok2 || (c && bytes.Equal(n, []byte("Error"))) {
+			break
 		}
-		if code != "" {
-			return fmt.Errorf("s3 error %s: %s", code, msg)
+		if c || self2 {
+			continue
+		}
+		switch {
+		case bytes.Equal(n, []byte("Code")):
+			se.Code = unescape(s.leaf())
+		case bytes.Equal(n, []byte("Message")):
+			se.Message = unescape(s.leaf())
+		case bytes.Equal(n, []byte("RequestId")):
+			se.RequestID = unescape(s.leaf())
+		default:
+			s.skipElement()
 		}
 	}
-	head := body
-	if len(head) > 200 {
-		head = head[:200]
+	if se.Code == "" {
+		return nil
 	}
-	return fmt.Errorf("unexpected S3 response: %q", head)
+	return &se
+}
+
+func bodyHead(body []byte) []byte {
+	if len(body) > 200 {
+		return body[:200]
+	}
+	return body
 }

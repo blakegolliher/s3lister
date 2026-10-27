@@ -19,8 +19,9 @@ billions of objects.
 - **Object tags (opt-in)**: `scan -tags` fetches every object's tags into a
   queryable `tags` map column — `WHERE map_extract(tags, 'env') = ['prod']`
   in DuckDB.
-- **Work-stealing parallelism**: idle readers steal work; huge flat prefixes are
-  range-split so no single worker becomes a straggler.
+- **Work-stealing parallelism**: idle readers steal work, and any prefix too
+  big for one page is split on demand while readers are idle, so no single
+  worker becomes a straggler.
 - **Live progress bar** with throughput and elapsed time; queue depth and
   per-worker detail go to the log file, along with a final stats block.
 - **Pure Go**: no CGO, no external services.
@@ -96,8 +97,23 @@ Options:
 ```
 
 Progress is shown as a live bar on the terminal; a status line is also written
-to the log file every 5 seconds. Each writer produces one `part-NNN.parquet`
-file, so `-writers 8` yields `part-000.parquet` … `part-007.parquet`.
+to the log file every 5 seconds, followed by an `[s3-list]` line covering the
+same 5 seconds of `ListObjectsV2` traffic: request count, latency (avg, p50,
+p90, p99, max), and any non-2xx statuses or transport errors (`[s3-tag]` too
+with `-tags`). The final stats block repeats those figures for the whole scan.
+Each writer produces one `part-NNN.parquet` file, so `-writers 8` yields
+`part-000.parquet` … `part-007.parquet`.
+
+A scan that could not list part of the bucket says so and exits non-zero.
+Failures come in two kinds, logged under different words:
+
+- `DENIED` — the endpoint answered HTTP 403 for that prefix. The credentials
+  cannot list it, so it is not retried and a re-run won't help.
+- `ABANDONED` — every retry failed on errors that may be transient (5xx,
+  timeouts, connection resets). Fix the endpoint and re-run.
+
+Every failed attempt along the way is logged with its S3 error code and
+request ID, so it can be matched against the endpoint's own logs.
 
 Each run starts fresh: existing `part-*.parquet` files in the output directory
 are removed before the scan begins.
@@ -261,9 +277,9 @@ Methodology, tuning, and full reproduction steps:
   the discovered addresses at startup.
 - **Writers** are CPU-bound on zstd compression. Roughly one writer per core is a
   good starting point. More writers = more output part files.
-- **Large flat prefixes** (millions of keys under one prefix with no delimiters)
-  are automatically range-split into parallel chunks so a single prefix does not
-  bottleneck one reader.
+- **Large prefixes** (millions of keys under one prefix) are split on demand:
+  whenever a reader is idle, a busy reader hands it the far half of its
+  remaining key range, so a single prefix does not bottleneck one reader.
 
 ### Why So Fast?
 

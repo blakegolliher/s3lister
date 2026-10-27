@@ -20,10 +20,16 @@ import (
 // fakeS3 serves ListObjectsV2 over a sorted in-memory key list with real S3
 // semantics: prefix filtering, delimiter grouping into CommonPrefixes,
 // start-after, continuation tokens, and max-keys accounting that counts keys
-// and common prefixes alike. It is the ground truth the reader pipeline —
-// fast client, parser, work-stealing, range-splitting — is verified against.
+// and common prefixes alike. Like VAST, it echoes start-after back into the
+// XML unescaped, so a split point containing '<' breaks the page as it does
+// on a real cluster. It is the ground truth the reader pipeline — fast
+// client, parser, work-stealing, range-splitting — is verified against.
 func fakeS3(t *testing.T, keys []string) *httptest.Server {
 	t.Helper()
+	return httptest.NewServer(fakeS3Handler(keys))
+}
+
+func fakeS3Handler(keys []string) http.HandlerFunc {
 	sorted := append([]string(nil), keys...)
 	sort.Strings(sorted)
 
@@ -34,7 +40,7 @@ func fakeS3(t *testing.T, keys []string) *httptest.Server {
 		return s
 	}
 
-	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	return func(w http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query()
 		if q.Get("list-type") != "2" {
 			http.Error(w, "not a v2 listing", http.StatusBadRequest)
@@ -92,6 +98,9 @@ func fakeS3(t *testing.T, keys []string) *httptest.Server {
 
 		var sb strings.Builder
 		sb.WriteString(`<?xml version="1.0" encoding="UTF-8"?><ListBucketResult>`)
+		if sa := q.Get("start-after"); sa != "" {
+			fmt.Fprintf(&sb, "<StartAfter>%s</StartAfter>", sa)
+		}
 		fmt.Fprintf(&sb, "<IsTruncated>%v</IsTruncated>", truncated)
 		if truncated {
 			fmt.Fprintf(&sb, "<NextContinuationToken>%s</NextContinuationToken>", esc(lastConsumed))
@@ -105,7 +114,7 @@ func fakeS3(t *testing.T, keys []string) *httptest.Server {
 		}
 		sb.WriteString(`</ListBucketResult>`)
 		io.WriteString(w, sb.String())
-	}))
+	}
 }
 
 // TestReaderPoolExactlyOnce runs the full reader pipeline against a fake

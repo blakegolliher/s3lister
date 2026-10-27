@@ -117,7 +117,7 @@ func (tp *TaggerPool) worker(ctx context.Context) {
 }
 
 // fetchWithRetry mirrors the reader's page-retry policy: exponential jittered
-// backoff on top of the SDK's own retries, bailing out early on cancellation.
+// backoff, bailing out early on cancellation or a 403 that retrying can't fix.
 func (tp *TaggerPool) fetchWithRetry(ctx context.Context, key string) (map[string]string, error) {
 	backoff := tp.backoffMin
 	var err error
@@ -139,7 +139,7 @@ func (tp *TaggerPool) fetchWithRetry(ctx context.Context, key string) (map[strin
 		if err == nil {
 			return tags, nil
 		}
-		if ctx.Err() != nil {
+		if ctx.Err() != nil || s3client.Permanent(err) {
 			return nil, err
 		}
 	}

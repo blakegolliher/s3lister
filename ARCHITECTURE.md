@@ -87,7 +87,47 @@ When a reader picks up a work item, it first tries to **split** the prefix into 
               "data/2023/" → split → ["data/2023/01/", "data/2023/02/", ...]
 ```
 
-Splitting stops at depth 4 to prevent excessive API calls on deeply nested structures.
+Sub-prefixes are pushed as each page reveals them, not after the whole level
+is listed. Below depth 8 a reader stops recursing and lists the remaining
+subtree flat (no delimiter), to avoid one request per tiny directory in very
+deep trees.
+
+> **Caveat:** a flat listing cannot report a directory it was not allowed to
+> read. VAST, at least, silently leaves unreadable directories out of a flat
+> listing (HTTP 200, no sign of them), whereas a delimiter listing shows them
+> as common prefixes that then fail with 403. So denied directories below
+> depth 8 are not detected.
+
+### Range Splitting
+
+A prefix level can hold millions of objects, and paging through it is
+inherently sequential. So while any reader is idle, a busy reader splits its
+**remaining** key range in two after each page: it keeps `(last, mid]` and
+pushes `(mid, end]` onto its deque for a thief. Each piece splits again the
+same way, so a big level fans out across every free reader within a few
+pages, and a busy scan (no idle readers) never fragments.
+
+`mid` is a synthetic key near the lexicographic midpoint of the remaining
+range, so finding it costs no requests. When the range is open-ended, "end"
+is the end of the prefix, and the first cuts often land past the last real
+key. The thief then finishes in one request and goes idle again, and the
+next cut lands closer; the halving reaches the real keys within a dozen or
+so of these cheap requests.
+
+Split points use only the bytes `0`–`~`. That keeps the `/` delimiter (and
+everything sorting below it) out of them, so every sub-prefix lies wholly on
+one side of a split point: each sub-prefix is pushed by exactly one range,
+and each object is emitted by exactly one range. Names that continue with
+non-ASCII bytes sort past every split point and stay in a level's last range.
+
+### Failures
+
+Each page is retried up to 6 times with exponential jittered backoff, and
+every failed attempt is logged with its S3 error code and request ID. HTTP
+403 is the exception: retrying cannot fix a refusal, so the work item is
+reported `DENIED` at once. A work item whose retries all fail is reported
+`ABANDONED`. Either way the scan exits non-zero and names the lost range;
+sub-prefixes already pushed from earlier pages are not lost with it.
 
 ### Idle Behavior
 
@@ -179,7 +219,13 @@ A single goroutine drives a `progress.Meter` on a 100 ms ticker. On a terminal i
 renders a live sweeping bar with humanized object count, smoothed (EMA) and peak
 throughput, queue depth, and elapsed time; on a non-TTY it degrades to a status
 line every 5 seconds. A 5-second ticker also writes a `[progress]` line to the
-log file. On completion, a stats block (objects, avg/peak rate, output size,
+log file, followed by an `[s3-list]` line (and `[s3-tag]` with `-tags`) with
+that window's request count, latency percentiles, and error statuses.
+
+The fast client times every request through its last response byte into a
+lock-free log-linear histogram (four buckets per power of two, so
+percentiles are within \~19%) and counts each HTTP status. Recording is a
+handful of atomic adds per request. On completion, a stats block (objects, avg/peak rate, output size,
 bytes-per-object, error count) is written to both stderr and the log.
 
 ## S3 Client
@@ -217,6 +263,9 @@ s3lister/
 │   ├── config/config.go         # TOML parsing and validation
 │   ├── model/record.go          # Shared ObjectRecord type (no storage deps)
 │   ├── s3client/client.go       # S3 client construction
+│   ├── s3client/fast.go         # Direct SigV4 hot path (LIST, tagging)
+│   ├── s3client/fastxml.go      # Purpose-built S3 XML parser
+│   ├── s3client/stats.go        # Per-request latency and status accounting
 │   ├── pq/pq.go                 # Parquet schema + per-file writer (zstd)
 │   ├── progress/progress.go     # TTY-aware progress bar + rate stats
 │   └── worker/

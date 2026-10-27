@@ -2,12 +2,13 @@ package worker
 
 import "sync"
 
-// WorkItem represents a unit of work (an S3 prefix or range to list).
+// WorkItem represents a unit of work: one prefix level, or the key range of
+// one level that was split off for an idle worker.
 type WorkItem struct {
 	Prefix     string
 	Depth      int
-	StartAfter string // if set, list only keys > StartAfter (for range splitting)
-	EndAt      string // if set, stop after emitting this key (inclusive range end)
+	StartAfter string // if set, list only entries > StartAfter (a split point)
+	EndAt      string // if set, list only entries <= EndAt (a split point)
 }
 
 // Deque is a thread-safe double-ended queue for work stealing.
